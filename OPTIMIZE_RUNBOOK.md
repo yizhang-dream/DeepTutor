@@ -100,6 +100,24 @@ DeepTutor 的 PDF 解析引擎是**全局开关**(`data/user/settings/document_p
 ---
 
 ## 完成定义
-- [ ] bge-m3:ollama list 有、两条 kb search 双语命中、kb list 双 ready
-- [ ] MinerU:torch.cuda.is_available()=True、单页 GPU 冒烟 <15s、engine 策略不变
-- [ ] 完成后更新本文件勾选框 + LEARNING_PLAN.md(如有变化)+ git commit
+- [x] bge-m3:ollama list 有、两条 kb search 双语命中、kb list 双 ready(2026-08-31 执行)
+- [x] MinerU:torch.cuda.is_available()=True(2.11.0+cu128)、单页 GPU 冒烟、engine 策略不变(见下方执行实录)
+- [x] 完成后更新本文件勾选框 + LEARNING_PLAN.md(如有变化)+ git commit
+
+## 执行实录(2026-08-31,补充踩坑)
+
+**任务 1(bge-m3)**:全链路完成。rl-notes(23 源,含 HF web 源)+ prob-stats(4 源)双 ready,默认 KB = rl-notes。
+额外踩坑:**两个 KB 并行重建会把 Windows socket 缓冲/端口耗尽**(rl-notes 爬虫 + prob-stats PDF 同时打 Ollama,
+报 `bind: ... system lacked sufficient buffer space`)→ **重建 KB 一律串行跑**。另:kb create 失败会留残骸,
+重试前先 `echo y | kb delete <name>`。
+
+**任务 2(MinerU GPU)**:完成,两处偏离手册:
+1. `uv pip install --upgrade "torch>=2.8"` **不会**把 2.13.0+cpu 换成 cu128 版(版本号比较视为已满足)——
+   必须加 `--reinstall-package torch --reinstall-package torchvision` 强制换。最终 2.11.0+cu128(cu128 源里
+   py3.12/win 的最新),回滚点 = 2.13.0+cpu。
+2. 冒烟计时口径:热跑总耗时 43s(torch/模型加载固定开销 ~35s 占大头),**推理阶段 ~5s**(Layout 2.4s vs CPU 39s,
+   约 10-15x),输出与 CPU 基线一致。单页场景看总耗时会误判,GPU 化收益在全本批量(911 页)时兑现。
+
+**顺手修的 DeepTutor bug**:中文 Windows 下 `deeptutor.exe start` 端口被占时必崩——launcher.py 的
+`_port_listeners_windows` 用 `text=True`(UTF-8)解码 netstat 的 GBK 输出,reader 线程 UnicodeDecodeError
+→ stdout=None → AttributeError。已加 `errors="replace"` + None 保护(lsof 分支同步),重启流程恢复正常。
