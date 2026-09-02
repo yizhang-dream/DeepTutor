@@ -129,15 +129,94 @@ def _extract_pdf(source: Path) -> Extraction:
     except Exception as exc:
         raise ReadingError(f"{source.name}: failed to read PDF ({exc})") from exc
 
+    extractor = "pymupdf"
+    if not any(unit.strip() for unit in units):
+        ocr_units = _ocr_pdf_units(source, page_count=len(units))
+        if ocr_units is not None:
+            units = ocr_units
+            extractor = "mineru-ocr"
+
     return Extraction(
         units=units,
         unit="page",
-        extractor="pymupdf",
+        extractor=extractor,
         has_raw_view=True,
         title=title,
         outline=outline,
         render_mode="pdf",
     )
+
+
+def _ocr_pdf_units(source: Path, *, page_count: int) -> tuple[str, ...] | None:
+    """Re-extract an image-only PDF through the MinerU parse engine (OCR).
+
+    Returns page-aligned unit texts so locators keep matching the raw PDF
+    view, or ``None`` when the fallback cannot help (disabled in settings,
+    MinerU not ready, OCR itself failed) — in which case the caller keeps the
+    empty extraction and ``extract_material`` raises the standard
+    "scanned document needs OCR" error.
+    """
+    from deeptutor.services.config.runtime_settings import load_document_parsing_settings
+    from deeptutor.services.parsing import get_parse_service
+
+    if not load_document_parsing_settings().get("ocr_fallback", True):
+        return None
+
+    logger.info("%s: no text layer, trying MinerU OCR fallback", source.name)
+    try:
+        parsed = get_parse_service().parse(source, engine="mineru")
+    except Exception as exc:
+        logger.warning("%s: MinerU OCR fallback failed: %s", source.name, exc)
+        return None
+
+    pieces: list[str] = [""] * page_count
+    degraded_orphans = 0
+    for block in parsed.blocks or []:
+        text = _ocr_block_text(block)
+        if not text:
+            continue
+        try:
+            page_idx = int(block.get("page_idx", -1))
+        except (TypeError, ValueError):
+            page_idx = -1
+        if 0 <= page_idx < page_count:
+            pieces[page_idx] = f"{pieces[page_idx]}\n\n{text}".strip()
+        else:
+            degraded_orphans += 1
+
+    if any(piece.strip() for piece in pieces):
+        if degraded_orphans:
+            logger.debug(
+                "%s: %d OCR blocks outside the page range dropped", source.name, degraded_orphans
+            )
+        return tuple(pieces)
+
+    # Structure without usable page indices (defensive): keep the text as a
+    # single unit rather than losing it; locators degrade to one page.
+    markdown = (parsed.markdown or "").strip()
+    if markdown:
+        logger.warning(
+            "%s: OCR blocks carried no page indices; emitting one combined unit",
+            source.name,
+        )
+        return (markdown,)
+    return None
+
+
+def _ocr_block_text(block: dict) -> str:
+    """Flatten one MinerU content_list block into readable text."""
+    parts: list[str] = []
+    for key in ("text", "equation_text", "table_body"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    for key in ("img_caption", "img_footnote", "table_caption"):
+        value = block.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+    return "\n".join(parts)
 
 
 def _extract_epub(source: Path) -> Extraction:

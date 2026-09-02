@@ -20,6 +20,13 @@ class ParserError(RuntimeError):
     ``MinerUError``) subclass this so callers can catch a single type."""
 
 
+class EmptyParseError(ParserError):
+    """Raised when an engine ran to completion but extracted no content — the
+    signature failure of a scanned (image-only) PDF under a text-layer
+    extractor. The parse service treats this as the trigger for the automatic
+    OCR fallback, distinct from engine crashes or configuration gates."""
+
+
 @dataclass(frozen=True)
 class ParsedDocument:
     """The bridge IR.
@@ -49,4 +56,4 @@ class ParsedDocument:
         return bool(self.blocks)
 
 
-__all__ = ["ParsedDocument", "ParserError"]
+__all__ = ["EmptyParseError", "ParsedDocument", "ParserError"]

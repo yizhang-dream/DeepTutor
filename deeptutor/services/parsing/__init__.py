@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from .base import Parser, ReadinessReport
 from .signature import ParserSignature
-from .types import ParsedDocument, ParserError
+from .types import EmptyParseError, ParsedDocument, ParserError
 
 
 def get_parse_service():
@@ -25,6 +25,7 @@ def get_parse_service():
 
 
 __all__ = [
+    "EmptyParseError",
     "ParsedDocument",
     "ParserError",
     "Parser",

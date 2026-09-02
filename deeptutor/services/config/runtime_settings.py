@@ -205,6 +205,9 @@ _MINERU_ENGINE_KEYS = frozenset(_DEFAULT_MINERU_ENGINE.keys())
 DEFAULT_DOCUMENT_PARSING_SETTINGS: dict[str, Any] = {
     "version": 2,
     "engine": _DEFAULT_DOCUMENT_PARSING_ENGINE,
+    # When the active engine extracts no content at all (scanned PDF under a
+    # text-layer extractor), automatically retry with the MinerU engine.
+    "ocr_fallback": True,
     "engines": {
         DOCUMENT_PARSING_ENGINE_TEXT_ONLY: _DEFAULT_TEXT_ONLY_ENGINE,
         DOCUMENT_PARSING_ENGINE_MINERU: _DEFAULT_MINERU_ENGINE,
@@ -917,7 +920,12 @@ class RuntimeSettingsService:
         if engine not in _DOCUMENT_PARSING_ENGINES:
             engine = _DEFAULT_DOCUMENT_PARSING_ENGINE
 
-        return {"version": 2, "engine": engine, "engines": engines_out}
+        return {
+            "version": 2,
+            "engine": engine,
+            "ocr_fallback": _coerce_bool(settings.get("ocr_fallback"), True),
+            "engines": engines_out,
+        }
 
     def _normalize_mineru_engine(self, settings: dict[str, Any]) -> dict[str, Any]:
         mode = _string(settings.get("mode")).lower()

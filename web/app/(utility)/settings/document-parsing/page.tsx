@@ -28,6 +28,7 @@ type Readiness = { ready: boolean; reason: string; message: string };
 
 type DocumentParsingPayload = {
   engine: string;
+  ocr_fallback: boolean;
   engines: Record<string, Record<string, unknown>>;
   available_engines: EngineMeta[];
   readiness: Record<string, Readiness>;
@@ -189,6 +190,49 @@ export default function DocumentParsingSettingsPage() {
                 );
               })}
             </div>
+          </section>
+
+          <section className="mb-10">
+            <header className="mb-3">
+              <h2 className="text-[15px] font-semibold tracking-tight text-[var(--foreground)]">
+                {t("Scanned-Document OCR Fallback")}
+              </h2>
+              <p className="mt-1 text-[12.5px] leading-relaxed text-[var(--muted-foreground)]">
+                {t(
+                  "When the active engine extracts no text at all (typical for scanned PDFs), automatically retry the file with MinerU's local OCR. Only runs when MinerU is installed and ready.",
+                )}
+              </p>
+            </header>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                putDocumentParsing({ ocr_fallback: !data.ocr_fallback })
+              }
+              className={`flex items-start justify-between gap-4 rounded-xl border px-4 py-3 text-left transition-colors disabled:opacity-60 ${
+                data.ocr_fallback
+                  ? "border-[var(--foreground)] bg-[var(--card)]"
+                  : "border-[var(--border)] hover:border-[var(--foreground)]/40"
+              }`}
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-medium text-[var(--foreground)]">
+                    {t("Auto OCR with MinerU")}
+                  </span>
+                  {data.ocr_fallback && (
+                    <span className="rounded-full bg-[var(--foreground)] px-2 py-0.5 text-[10px] font-medium text-[var(--background)]">
+                      {t("On")}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-[12px] text-[var(--muted-foreground)]">
+                  {t(
+                    "Large scanned files can take several minutes per hundred pages with local OCR.",
+                  )}
+                </p>
+              </div>
+            </button>
           </section>
 
           {data.engine === "text_only" && <TextOnlyPanel />}

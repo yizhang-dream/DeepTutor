@@ -15,12 +15,13 @@ from typing import Callable, Optional
 
 from deeptutor.services.config.runtime_settings import (
     _DEFAULT_DOCUMENT_PARSING_ENGINE,
+    DOCUMENT_PARSING_ENGINE_MINERU,
     load_document_parsing_settings,
 )
 
 from . import cache
 from .engines.factory import get_parser
-from .types import ParsedDocument, ParserError
+from .types import EmptyParseError, ParsedDocument, ParserError
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +59,54 @@ class ParseService:
         signature. Raises :class:`ParserError` when the engine is not ready
         (e.g. local models not downloaded and auto-download disabled) or the
         file type is unsupported.
+
+        If the engine runs but extracts no content — the signature failure of
+        a scanned (image-only) PDF under a text-layer extractor — and the
+        automatic OCR fallback is enabled (settings key ``ocr_fallback``, on
+        by default), the file is re-parsed with MinerU and that result is
+        returned instead. ``parsed.engine`` records which engine actually
+        produced the content.
         """
         source_path = Path(source_path)
         if not source_path.is_file():
             raise ParserError(f"File to parse not found: {source_path}")
 
         engine_name = (engine or self.active_engine()).strip().lower()
+        try:
+            return self._parse_once(source_path, engine_name, on_output)
+        except EmptyParseError as exc:
+            fallback = self._ocr_fallback_engine(source_path, engine_name)
+            if fallback is None:
+                raise
+            logger.info(
+                "Engine '%s' extracted no content from %s; retrying with '%s' (OCR fallback)",
+                engine_name,
+                source_path.name,
+                fallback,
+            )
+            if on_output is not None:
+                on_output(
+                    f"[fallback] '{engine_name}' extracted no text "
+                    f"— retrying with '{fallback}' (OCR)..."
+                )
+            try:
+                return self._parse_once(source_path, fallback, on_output)
+            except EmptyParseError:
+                # The OCR engine also found nothing (e.g. blank pages): the
+                # original empty-result error is the honest one to surface.
+                raise exc from None
+            except ParserError as fallback_error:
+                logger.warning(
+                    "OCR fallback with '%s' failed: %s", fallback, fallback_error
+                )
+                raise exc from fallback_error
+
+    def _parse_once(
+        self,
+        source_path: Path,
+        engine_name: str,
+        on_output: Optional[Callable[[str], None]],
+    ) -> ParsedDocument:
         parser = get_parser(engine_name)
         config = parser.resolve_config()
 
@@ -102,8 +145,8 @@ class ParseService:
         try:
             parser.parse(source_path, workdir, config=config, on_output=on_output)
             markdown, blocks, asset_dir = cache.load_ir(workdir)
-            if not markdown and not blocks:
-                raise ParserError(
+            if not (markdown or "").strip() and not blocks:
+                raise EmptyParseError(
                     f"The '{engine_name}' engine produced no content for {source_path.name}."
                 )
             cache.write_manifest(
@@ -127,6 +170,35 @@ class ParseService:
         except Exception:
             cache.cleanup_failed(workdir)
             raise
+
+    def _ocr_fallback_engine(self, source_path: Path, failed_engine: str) -> Optional[str]:
+        """Return the engine id to retry an empty parse with, or ``None``.
+
+        The fallback is MinerU (the OCR-grade engine). It is skipped when the
+        ``ocr_fallback`` setting is off, the failed engine already is MinerU,
+        MinerU doesn't support this file type, or MinerU isn't ready (CLI /
+        models missing) — in every skip case the original error propagates
+        unchanged.
+        """
+        settings = load_document_parsing_settings()
+        if not bool(settings.get("ocr_fallback", True)):
+            return None
+        if failed_engine == DOCUMENT_PARSING_ENGINE_MINERU:
+            return None
+        try:
+            parser = get_parser(DOCUMENT_PARSING_ENGINE_MINERU)
+        except ParserError:
+            return None
+        supported = parser.supported_formats()
+        if supported and source_path.suffix.lower() not in supported:
+            return None
+        report = parser.is_ready(parser.resolve_config())
+        if not report.ready:
+            logger.info(
+                "OCR fallback skipped: MinerU is not ready (%s)", report.message
+            )
+            return None
+        return DOCUMENT_PARSING_ENGINE_MINERU
 
 
 _service: Optional[ParseService] = None

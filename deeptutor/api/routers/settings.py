@@ -297,6 +297,8 @@ class DocumentParsingUpdate(BaseModel):
 
     engine: Optional[str] = None
     engines: Optional[dict[str, dict]] = None
+    # Toggle for the empty-result → MinerU OCR retry (None = keep stored).
+    ocr_fallback: Optional[bool] = None
 
 
 class DocumentParsingTest(BaseModel):
@@ -1017,6 +1019,7 @@ def _document_parsing_payload() -> dict[str, Any]:
     docling_slice = engines.get("docling", {})
     return {
         "engine": full.get("engine"),
+        "ocr_fallback": bool(full.get("ocr_fallback", True)),
         "engines": redacted,
         "available_engines": available,
         "readiness": readiness,
@@ -1098,7 +1101,14 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
         engines[name].update(merged)
 
     new_engine = payload.engine or full.get("engine")
-    service.save_document_parsing({"engine": new_engine, "engines": engines})
+    ocr_fallback = (
+        payload.ocr_fallback
+        if payload.ocr_fallback is not None
+        else bool(full.get("ocr_fallback", True))
+    )
+    service.save_document_parsing(
+        {"engine": new_engine, "ocr_fallback": ocr_fallback, "engines": engines}
+    )
     return _document_parsing_payload()
 
 
