@@ -21,6 +21,7 @@ from deeptutor.services.config.runtime_settings import (
 
 from . import cache
 from .engines.factory import get_parser
+from .text_quality import has_meaningful_text, pdf_page_count
 from .types import EmptyParseError, ParsedDocument, ParserError
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,17 @@ class ParseService:
             if not (markdown or "").strip() and not blocks:
                 raise EmptyParseError(
                     f"The '{engine_name}' engine produced no content for {source_path.name}."
+                )
+            if (
+                source_path.suffix.lower() == ".pdf"
+                and not has_meaningful_text(markdown or "", page_count=pdf_page_count(source_path))
+            ):
+                # Figure-label noise from a scanned PDF defeats a bare
+                # strip() check while carrying no prose — treat it as an
+                # empty parse so the OCR fallback gets a real chance.
+                raise EmptyParseError(
+                    f"The '{engine_name}' engine produced no meaningful text "
+                    f"for {source_path.name} (scan-like text layer)."
                 )
             cache.write_manifest(
                 workdir,

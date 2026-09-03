@@ -21,12 +21,13 @@ import logging
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 from typing import Any, Literal
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, UploadFile
 from fastapi.params import File
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
 from deeptutor.reading import (
@@ -54,6 +55,10 @@ from deeptutor.utils.document_validator import DocumentValidator
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Serializes background (async=true) ingests: concurrent document parses would
+# otherwise race inside the store/catalog for the same cache directories.
+_INGEST_LOCK = threading.Lock()
 
 # Streaming upload ceiling. Same number the extractor enforces, so a file that
 # passes here cannot then be rejected deeper in with a less helpful message.
@@ -812,13 +817,20 @@ async def list_materials() -> list[MaterialInfo]:
 
 @router.post("/materials", response_model=MaterialDetail)
 async def upload_material(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),  # noqa: B008
     reuse: bool = Query(default=True),
+    async_mode: bool = Query(default=False, alias="async"),
 ) -> MaterialDetail:
     """Ingest an uploaded document and return it ready to read.
 
     The upload is streamed to a temp file with a running size check, so an
     oversized file is rejected before it is fully buffered rather than after.
+
+    Parsing happens inline, so scanned PDFs (which fall back to a minutes-long
+    OCR run) can outlive HTTP-level client timeouts. Pass ``async=true`` to
+    get a ``202 {"status": "processing"}`` immediately and let the ingest run
+    as a background task; poll ``GET /materials`` until the file shows up.
     """
     filename = (file.filename or "").strip()
     if not filename:
@@ -849,6 +861,29 @@ async def upload_material(
                 tmp_path, filename=filename
             )
             manifest = store.manifest(record.material_id)
+        elif async_mode:
+            # Move the validated upload somewhere that outlives this request
+            # (the finally below removes tmp_dir) and ingest off-request.
+            staging_dir = Path(tempfile.mkdtemp(prefix="dt-reading-async-"))
+            staged = staging_dir / tmp_path.name
+            tmp_path.replace(staged)
+
+            def _ingest_background() -> None:
+                try:
+                    with _INGEST_LOCK:
+                        manifest = store.ingest(staged, filename=filename)
+                        if _catalog().get_material(manifest.material_id) is None:
+                            _catalog().register_manifest(manifest)
+                except Exception:
+                    logger.exception("Async reading ingest failed for %s", filename)
+                finally:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+            background_tasks.add_task(_ingest_background)
+            return JSONResponse(
+                status_code=202,
+                content={"status": "processing", "filename": filename},
+            )
         else:
             manifest = store.ingest(tmp_path, filename=filename)
             catalog = _catalog()

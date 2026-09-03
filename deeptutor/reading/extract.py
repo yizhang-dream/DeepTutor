@@ -34,6 +34,7 @@ from pathlib import Path
 import re
 
 from deeptutor.reading.models import OutlineEntry, ReadingError, RenderMode, UnitKind, UnitReference
+from deeptutor.services.parsing.text_quality import has_meaningful_text
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,10 @@ def _extract_pdf(source: Path) -> Extraction:
         raise ReadingError(f"{source.name}: failed to read PDF ({exc})") from exc
 
     extractor = "pymupdf"
-    if not any(unit.strip() for unit in units):
+    # Figure-label text objects on scanned pages defeat a bare strip() check
+    # (a few dozen alphanumerics per page) while carrying no readable prose —
+    # judge density so such scans still reach the OCR fallback.
+    if not has_meaningful_text("\n".join(units), page_count=len(units)):
         ocr_units = _ocr_pdf_units(source, page_count=len(units))
         if ocr_units is not None:
             units = ocr_units

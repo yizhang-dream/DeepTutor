@@ -23,6 +23,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -2918,8 +2919,14 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
 async def reindex_knowledge_base(
     kb_name: str,
     background_tasks: BackgroundTasks,
+    force: bool = Query(default=False),
 ):
     """Re-index ``kb_name`` through its bound RAG provider.
+
+    Pass ``force=true`` to rebuild even when a matching index version exists.
+    File deletions do not prune vectors inline (see ``delete_kb_file``), so a
+    forced rebuild is the way to purge removed documents from retrieval when
+    the embedding configuration itself has not changed.
 
     LlamaIndex still keys versions by the active embedding model. The other
     providers keep synthetic provider-keyed versions, so they should rebuild
@@ -2929,7 +2936,9 @@ async def reindex_knowledge_base(
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
         _assert_not_connected_kb(kb_name, kb_entry)
-        force_reindex = str(kb_entry.get("status") or "").lower() == "error"
+        force_reindex = (
+            str(kb_entry.get("status") or "").lower() == "error" or bool(force)
+        )
         kb_provider = _validate_registered_provider(
             kb_entry.get("rag_provider") or DEFAULT_PROVIDER
         )

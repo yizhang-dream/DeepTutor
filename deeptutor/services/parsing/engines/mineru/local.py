@@ -59,6 +59,7 @@ def parse_pdf_with_mineru(
     on_output: Callable[[str], None] | None = None,
     cli_command: str | None = None,
     extra_env: dict[str, str] | None = None,
+    backend: str | None = None,
 ):
     """
     Parse PDF file using MinerU
@@ -75,6 +76,10 @@ def parse_pdf_with_mineru(
         extra_env: Env vars merged over os.environ for the subprocess (e.g.
             MINERU_MODEL_SOURCE / HF_ENDPOINT so a lazy first-parse model
             download honors the configured source and mirror).
+        backend: MinerU ``-b`` backend passed through verbatim (e.g.
+            "pipeline", "hybrid-engine"). None = CLI default. The CLI default
+            is hybrid-engine, which is far heavier than pipeline for plain
+            document OCR, so callers should pin this explicitly.
 
     Returns:
         bool: Whether parsing was successful
@@ -128,6 +133,8 @@ def parse_pdf_with_mineru(
         temp_output.mkdir(parents=True, exist_ok=True)
 
         cmd = [mineru_cmd, "-p", str(pdf_file), "-o", str(temp_output)]
+        if backend:
+            cmd += ["-b", backend]
 
         print(f"🔧 Executing command: {' '.join(cmd)}")
 

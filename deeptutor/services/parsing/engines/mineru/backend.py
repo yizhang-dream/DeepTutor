@@ -144,12 +144,24 @@ def _parse_local(
     subprocess_env = {**download_env, **render_env_overrides()}
 
     logger.info("Parsing %s via local MinerU CLI (%s)", pdf_path.name, cli_command or "PATH")
+    # The CLI's default backend is hybrid-engine (heavy VLM hybrid); honor the
+    # configured model_version so "pipeline" runs the light pipeline backend
+    # locally too instead of only shaping the cloud-API payload.
+    _MODEL_VERSION_TO_BACKEND = {
+        "pipeline": "pipeline",
+        "hybrid": "hybrid-engine",
+        "hybrid-engine": "hybrid-engine",
+        "vlm": "vlm-engine",
+        "vlm-engine": "vlm-engine",
+    }
+    backend = _MODEL_VERSION_TO_BACKEND.get((config.model_version or "").strip().lower())
     ok = parse_pdf_with_mineru(
         str(pdf_path),
         str(output_base),
         on_output=on_output,
         cli_command=cli_command,
         extra_env=subprocess_env,
+        backend=backend,
     )
     if not ok:
         raise MinerUError(
