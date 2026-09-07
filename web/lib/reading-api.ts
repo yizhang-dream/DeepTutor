@@ -238,6 +238,39 @@ export async function getUnitText(
   );
 }
 
+export interface MaterialMediaItem {
+  name: string;
+  locator: number;
+  mime: string;
+  bytes: number;
+}
+
+/** Embedded images (DOCX/PPTX) with the locator each belongs to. */
+export async function getMaterialMedia(
+  materialId: string,
+): Promise<MaterialMediaItem[]> {
+  const payload: unknown = await unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/media`), {
+      cache: "no-store",
+    }),
+  );
+  if (!Array.isArray(payload)) return [];
+  return payload.filter(
+    (row): row is MaterialMediaItem =>
+      Boolean(row) &&
+      typeof row === "object" &&
+      typeof (row as MaterialMediaItem).name === "string" &&
+      Number.isFinite((row as MaterialMediaItem).locator),
+  );
+}
+
+/** Public URL for one stored embedded image. */
+export function materialMediaUrl(materialId: string, name: string): string {
+  return apiUrl(
+    `${BASE}/materials/${encodeURIComponent(materialId)}/media/${encodeURIComponent(name)}`,
+  );
+}
+
 export async function listReadingExtensions(): Promise<
   ReadingExtensionManifest[]
 > {

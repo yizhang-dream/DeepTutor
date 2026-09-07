@@ -21,7 +21,12 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AnnotationItem, UnitKind } from "@/lib/reading-api";
-import { getUnitText } from "@/lib/reading-api";
+import {
+  getMaterialMedia,
+  getUnitText,
+  materialMediaUrl,
+  type MaterialMediaItem,
+} from "@/lib/reading-api";
 import {
   DEFAULT_FONT_SIZE,
   DEFAULT_LINE_WIDTH,
@@ -110,6 +115,7 @@ export function TextUnitView({
   } | null>(null);
   const [locator, setLocator] = useState(1);
   const [text, setText] = useState("");
+  const [media, setMedia] = useState<MaterialMediaItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(DEFAULT_FONT_SIZE);
@@ -202,6 +208,29 @@ export function TextUnitView({
   useEffect(() => {
     setLocator(1);
   }, [materialId]);
+
+  // Embedded pictures (DOCX/PPTX ingest), keyed to locators. Materials
+  // without images simply return an empty index; failure keeps the text
+  // readable without the strip.
+  useEffect(() => {
+    let cancelled = false;
+    setMedia([]);
+    getMaterialMedia(materialId)
+      .then((items) => {
+        if (!cancelled) setMedia(items);
+      })
+      .catch(() => {
+        if (!cancelled) setMedia([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [materialId]);
+
+  const unitMedia = useMemo(
+    () => media.filter((item) => item.locator === locator),
+    [locator, media],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -541,25 +570,51 @@ export function TextUnitView({
         ) : error ? (
           <p className="text-[12px] text-[var(--muted-foreground)]">{error}</p>
         ) : (
-          <article
-            ref={articleRef}
-            className={`mx-auto whitespace-pre-wrap leading-[1.75] selection:bg-[var(--primary)]/20 ${
-              serif ? "font-serif" : "font-sans"
-            }`}
-            style={{
-              maxWidth: `${lineWidth}ch`,
-              fontSize: `${fontSize}px`,
-              color: readerTheme === "auto" ? "var(--foreground)" : "inherit",
-            }}
-          >
-            {!text.trim() ? (
-              <span className="text-[var(--muted-foreground)]">
-                {t("This section has no extractable text.")}
-              </span>
-            ) : (
-              <TextWithHeadings text={text} headings={pageHeadings} />
+          <>
+            <article
+              ref={articleRef}
+              className={`mx-auto whitespace-pre-wrap leading-[1.75] selection:bg-[var(--primary)]/20 ${
+                serif ? "font-serif" : "font-sans"
+              }`}
+              style={{
+                maxWidth: `${lineWidth}ch`,
+                fontSize: `${fontSize}px`,
+                color: readerTheme === "auto" ? "var(--foreground)" : "inherit",
+              }}
+            >
+              {!text.trim() ? (
+                <span className="text-[var(--muted-foreground)]">
+                  {t("This section has no extractable text.")}
+                </span>
+              ) : (
+                <TextWithHeadings text={text} headings={pageHeadings} />
+              )}
+            </article>
+            {unitMedia.length > 0 && (
+              <div
+                className="mx-auto mt-6 flex flex-col gap-5 pb-4"
+                style={{ maxWidth: `${lineWidth}ch` }}
+              >
+                {unitMedia.map((item) => (
+                  <figure
+                    key={item.name}
+                    className="flex flex-col items-center"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={materialMediaUrl(materialId, item.name)}
+                      alt={item.name}
+                      loading="lazy"
+                      className="max-h-[70vh] w-auto max-w-full rounded-lg border border-[var(--border)]"
+                    />
+                    <figcaption className="mt-1.5 text-center font-mono text-[10.5px] text-[var(--muted-foreground)]">
+                      {item.name}
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
             )}
-          </article>
+          </>
         )}
       </div>
     </div>

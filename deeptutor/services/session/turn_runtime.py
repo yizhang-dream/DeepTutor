@@ -5,6 +5,7 @@ Turn-level runtime manager for unified chat streaming.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Callable, Sequence
 import contextlib
 from contextvars import Token
@@ -331,6 +332,45 @@ def _reading_viewport(value: Any) -> dict[str, Any]:
     if selection:
         viewport["selection"] = selection[:READING_SELECTION_MAX_CHARS]
     return viewport
+
+
+# Images attached per reading turn when the open page has embedded figures.
+READING_VIEWPORT_MAX_IMAGES = 4
+
+
+def _reading_viewport_image_records(material_id: str, viewport: dict[str, Any]) -> list[dict]:
+    """Image attachment records for the figures on the currently open page."""
+    try:
+        locator = int(viewport.get("locator") or 0)
+    except (TypeError, ValueError):
+        locator = 0
+    if not material_id or locator <= 0:
+        return []
+    try:
+        from deeptutor.reading import ReadingStore
+
+        store = ReadingStore()
+        rows = store.media_items_at(material_id, locator)
+        records: list[dict] = []
+        for index, row in enumerate(rows[:READING_VIEWPORT_MAX_IMAGES], start=1):
+            path = store.media_path(material_id, str(row.get("name") or ""))
+            if path is None:
+                continue
+            records.append(
+                {
+                    "type": "image",
+                    "url": "",
+                    "base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "filename": str(row.get("name") or f"image-{index}.png"),
+                    "mime_type": str(row.get("mime") or "image/png"),
+                    "id": f"rv-{material_id[:12]}-{locator}-{index}",
+                    "embedded": True,
+                }
+            )
+        return records
+    except Exception:
+        logger.warning("reading viewport image lookup failed", exc_info=True)
+        return []
 
 
 def _course_field(value: Any, key: str, default: Any = "") -> Any:
@@ -2119,6 +2159,50 @@ class TurnRuntimeManager:
             from deeptutor.utils.document_extractor import extract_documents_from_records
 
             document_texts, attachment_records = extract_documents_from_records(attachment_records)
+
+            # Immersive reading: the embedded figures on the page the user is
+            # currently looking at ride along as image attachments, so a
+            # vision model sees what the question is about. Pages without
+            # images add nothing; pages with them add at most
+            # READING_VIEWPORT_MAX_IMAGES attachments.
+            if capability_name == "immersive_reading":
+                attachment_records.extend(
+                    _reading_viewport_image_records(
+                        _reading_material_id(payload.get("reading_material_id")),
+                        _reading_viewport(payload.get("reading_viewport")),
+                    )
+                )
+
+            # Embedded images harvested out of office documents arrive with
+            # base64 and no URL — host them too so message previews survive
+            # the base64 pruning below and the reader pane can display them.
+            for record in attachment_records:
+                if record.get("url") or not record.get("base64"):
+                    continue
+                try:
+                    raw_bytes = _b64.b64decode(record["base64"], validate=False)
+                except Exception as exc:
+                    logger.warning(
+                        "skipping embedded-image upload for %r: invalid base64 (%s)",
+                        record.get("filename"),
+                        exc,
+                    )
+                    continue
+                try:
+                    record["url"] = await attachment_store.put(
+                        session_id=session_id,
+                        attachment_id=record.get("id") or _uuid.uuid4().hex[:12],
+                        filename=record.get("filename", "") or "image",
+                        data=raw_bytes,
+                        mime_type=record.get("mime_type", "") or "",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "attachment store rejected embedded image %r: %s",
+                        record.get("filename"),
+                        exc,
+                    )
+
             attachments = [
                 Attachment(
                     type=r.get("type", "file"),

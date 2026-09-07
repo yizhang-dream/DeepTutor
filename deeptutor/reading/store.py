@@ -33,6 +33,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -68,6 +69,8 @@ POSITIONS_DIR = "positions"
 UNIT_REFS_NAME = "unit_refs.json"
 UNITS_DIR = "units"
 RAW_DIR = "raw"
+MEDIA_DIR = "media"
+MEDIA_INDEX_NAME = "media.json"
 
 # Both content hashes and separately minted catalog ids are path-safe. Content
 # directories themselves remain hashes only.
@@ -262,6 +265,25 @@ class ReadingStore:
             for index, unit in enumerate(extraction.units, start=1):
                 self._unit_file(stage_dir, index).write_text(unit, encoding="utf-8")
 
+            # Embedded pictures (DOCX/PPTX): bytes under media/, addresses in
+            # media.json. Written before the manifest so a reader that trusts
+            # the manifest never finds a missing image behind it.
+            media_rows: list[dict[str, Any]] = []
+            if extraction.media:
+                media_dir = stage_dir / MEDIA_DIR
+                media_dir.mkdir(parents=True, exist_ok=True)
+                for item in extraction.media:
+                    (media_dir / item.name).write_bytes(item.data)
+                    media_rows.append(
+                        {
+                            "name": item.name,
+                            "locator": item.locator,
+                            "mime": item.mime_type,
+                            "bytes": len(item.data),
+                        }
+                    )
+                _atomic_write(stage_dir / MEDIA_INDEX_NAME, json.dumps(media_rows, ensure_ascii=False))
+
             if extraction.render_mode != "text":
                 raw_dir = stage_dir / RAW_DIR
                 raw_dir.mkdir(parents=True, exist_ok=True)
@@ -303,6 +325,7 @@ class ReadingStore:
                 # pdf.js. EPUB dispatch is carried by ``render_mode`` instead.
                 has_raw_view=extraction.render_mode == "pdf",
                 render_mode=extraction.render_mode,
+                media_count=len(media_rows),
             )
             # Manifest last: its presence is the "this material is usable"
             # signal, so it must not appear before the units it describes.
@@ -615,6 +638,28 @@ class ReadingStore:
         if manifest.render_mode == "text":
             return None
         return self._find_raw(self._dir(material_id))
+
+    def media_items(self, material_id: str) -> list[dict[str, Any]]:
+        """The embedded-image index: name / locator / mime / byte size rows."""
+        rows = _read_json(self._dir(material_id) / MEDIA_INDEX_NAME)
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict) and row.get("name")]
+
+    def media_items_at(self, material_id: str, locator: int) -> list[dict[str, Any]]:
+        """Embedded images attached to one locator, in extraction order."""
+        return [row for row in self.media_items(material_id) if row.get("locator") == locator]
+
+    def media_path(self, material_id: str, name: str) -> Path | None:
+        """Resolve a media file by index-validated name (no traversal)."""
+        clean = posixpath.basename(str(name or "").replace("\\", "/"))
+        if not clean:
+            return None
+        if not any(row.get("name") == clean for row in self.media_items(material_id)):
+            return None
+        path = self._dir(material_id) / MEDIA_DIR / clean
+        return path if path.is_file() else None
+
 
     def unit_references(self, material_id: str) -> list[UnitReference]:
         """Source-native addresses aligned with the numeric locator space."""
