@@ -946,10 +946,8 @@ def start(home: str | Path | None = None, *, dev: bool = False) -> None:
     _reset_runtime_singletons()
 
     from deeptutor.services.config import (
-        HTTP_KEEP_ALIVE_TIMEOUT,
         ensure_runtime_settings_files,
         export_runtime_settings_to_env,
-        get_ws_max_size,
         load_auth_settings,
         load_launch_settings,
     )
@@ -1059,35 +1057,25 @@ def start(home: str | Path | None = None, *, dev: bool = False) -> None:
     if frontend.kind == "source-production":
         common_env["DEEPTUTOR_NEXT_DIST_DIR"] = SOURCE_PRODUCTION_DIST_DIR
 
+    # The backend must NOT be spawned as bare `python -m uvicorn`: uvicorn can
+    # end up on a Windows SelectorEventLoop (reload/workers install their own
+    # loop factory; older releases default to selector), which breaks asyncio
+    # child-process APIs and deadlocked the whole API during KB indexing
+    # (incident 2026-09-08). deeptutor.api.run_server is the hardened
+    # equivalent of `deeptutor serve`: it pins the Proactor policy, sets SERVER
+    # run mode, configures logging, and applies the same tuning — log-level
+    # info, access_log disabled, ws-max-size and keep-alive from system.json —
+    # reading the exact same config services as the flags that used to be
+    # passed here. The resolved port is passed explicitly because port-conflict
+    # handling may have picked a non-default one.
     backend_cmd = [
         sys.executable,
         "-m",
-        "uvicorn",
-        "deeptutor.api.main:app",
+        "deeptutor.api.run_server",
         "--host",
         "0.0.0.0",
         "--port",
         str(backend_port),
-        "--log-level",
-        "info",
-        # Disable uvicorn's per-request access log. The selective_access_log
-        # middleware (deeptutor/api/main.py) surfaces only non-200s, so routine
-        # 200 polling (/settings, /tools, /knowledge/list, ...) stays out of the
-        # logs — matching run_server.py's access_log=False.
-        "--no-access-log",
-        # Chat attachments ride the unified WS as base64 in one JSON message;
-        # uvicorn's default 16MB frame cap would sever the socket on uploads
-        # allowed by the configured policy. Derived from system.json — raising
-        # the attachment limits therefore takes a restart to fully apply.
-        "--ws-max-size",
-        str(get_ws_max_size()),
-        # Outlast the frontend proxy's idle socket pool. web/proxy.ts forwards
-        # over Node's http.globalAgent, which reaps idle sockets on its own 5s
-        # timer — the same value as uvicorn's default, so both ends raced to
-        # close the same socket and a FIN landing on a reuse surfaced as
-        # ECONNRESET ("Failed to proxy ... socket hang up" -> 500).
-        "--timeout-keep-alive",
-        str(HTTP_KEEP_ALIVE_TIMEOUT),
     ]
 
     processes: list[ManagedProcess] = []

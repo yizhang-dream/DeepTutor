@@ -2861,6 +2861,22 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
                     meta_err,
                 )
 
+            # Terminal progress write — mirrors run_initialization_task /
+            # run_upload_processing_task. Without it `.progress.json` stays at
+            # the last embedding-batch snapshot and GET /progress reports a
+            # frozen `processing_documents` stage forever, even though
+            # kb_config.json below already says ready (incident 2026-09-08).
+            progress_tracker.update(
+                ProgressStage.COMPLETED,
+                message_key="Re-index complete: {{count}} document(s) indexed",
+                message_params={"count": len(file_paths)},
+                current=len(file_paths),
+                total=len(file_paths),
+                indexed_count=len(file_paths),
+                index_changed=True,
+                index_action="reindex",
+            )
+
             manager = get_kb_manager()
             manager.update_kb_status(
                 name=kb_name,
