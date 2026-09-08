@@ -308,6 +308,8 @@ export function materialMediaUrl(materialId: string, name: string): string {
   return apiUrl(
     `${BASE}/materials/${encodeURIComponent(materialId)}/media/${encodeURIComponent(name)}`,
   );
+}
+
 export interface ReadingTranscript {
   material_id: string;
   revision: number;
