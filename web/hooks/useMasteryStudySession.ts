@@ -5,9 +5,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
-  useUnifiedChat,
+  useChatStateAdapter,
   type SessionConfiguration,
-} from "@/context/UnifiedChatContext";
+} from "@/features/chat/ChatStateAdapter";
+import { MASTERY_CAPABILITY_VALUE } from "@/features/capabilities/presentation";
 import { useMasteryPathActivity } from "@/hooks/useMasteryPathActivity";
 import {
   fetchMasteryTopic,
@@ -18,11 +19,14 @@ import {
   isMasteryDraftSessionReady,
   type MasteryDraftRouteGuard,
 } from "@/lib/mastery-study-route";
+import { courseSessionConfiguration } from "@/lib/course-session-scope";
+import type { MasteryMode } from "@/lib/mastery-mode";
+import { MASTERY_WORKSPACE_MODE } from "@/lib/workspace-mode";
 
 /**
  * Resolves which topic and which chat session a study route is showing.
  *
- * Route → session is a small state machine: a bare `/study` route opens a
+ * Route → session is a small state machine: a bare `/sessions` route opens a
  * draft and rewrites the URL once the session exists, while a route that
  * names a session must first prove that session belongs to this topic. Both
  * paths key their bookkeeping on the route so a fast topic switch can never
@@ -31,6 +35,14 @@ import {
 export function useMasteryStudySession(
   pathId: string,
   routeSessionId?: string,
+  courseId = "",
+  /**
+   * What a conversation opened on this route is for. Only meaningful for a
+   * new one: an existing conversation's kind was decided when it was opened
+   * and is read back from the server, because letting a URL restate it would
+   * let a link hand a session tools its kind withholds.
+   */
+  requestedMode: MasteryMode = "study",
 ) {
   const router = useRouter();
   const { t } = useTranslation();
@@ -40,7 +52,7 @@ export function useMasteryStudySession(
     configureSession,
     loadSession,
     showCachedSession,
-  } = useUnifiedChat();
+  } = useChatStateAdapter();
 
   const [topic, setTopic] = useState<MasteryTopic | null>(null);
   const [topicError, setTopicError] = useState<string | null>(null);
@@ -88,11 +100,19 @@ export function useMasteryStudySession(
   );
   const sessionConfiguration = useMemo<SessionConfiguration>(
     () => ({
-      capability: "mastery_path",
+      workspaceMode: MASTERY_WORKSPACE_MODE,
+      // Sent only when opening a new conversation; a route that names an
+      // existing one leaves the stored kind alone (see the parameter's note).
+      ...(routeSessionId ? {} : { masterySessionMode: requestedMode }),
+      // The study screen runs one action: the tutor loop. Stated here, at the
+      // session's source of truth, rather than only asserted by the composer —
+      // otherwise every configuration pass would reset it to chat and the
+      // composer would set it back, once per render.
+      capability: MASTERY_CAPABILITY_VALUE,
       masteryPathId: pathId,
       knowledgeBases,
     }),
-    [knowledgeBases, pathId],
+    [knowledgeBases, pathId, requestedMode, routeSessionId],
   );
 
   useEffect(() => {
@@ -106,7 +126,7 @@ export function useMasteryStudySession(
         routeKey,
         previousSessionId: state.sessionId,
       };
-      newSession(sessionConfiguration);
+      newSession(courseSessionConfiguration(sessionConfiguration, courseId));
       return;
     }
 
@@ -126,14 +146,22 @@ export function useMasteryStudySession(
           );
         }
         const cached = showCachedSession(routeSessionId);
-        if (cached) configureSession(sessionConfiguration, routeSessionId);
+        if (cached) {
+          configureSession(
+            courseSessionConfiguration(sessionConfiguration, courseId),
+            routeSessionId,
+          );
+        }
         return loadSession(
           routeSessionId,
           cached ? { revalidate: true } : undefined,
         );
       })
       .then(() => {
-        configureSession(sessionConfiguration, routeSessionId);
+        configureSession(
+          courseSessionConfiguration(sessionConfiguration, courseId),
+          routeSessionId,
+        );
         setSessionResolution({ routeKey, error: null });
       })
       .catch((reason: unknown) => {
@@ -146,6 +174,7 @@ export function useMasteryStudySession(
         });
       });
   }, [
+    courseId,
     configureSession,
     currentRouteKey,
     loadSession,
@@ -173,12 +202,18 @@ export function useMasteryStudySession(
       })
     )
       return;
+    const courseQuery = courseId
+      ? `?course=${encodeURIComponent(courseId)}`
+      : "";
     router.replace(
-      `/mastery/${encodeURIComponent(pathId)}/study/${encodeURIComponent(newSessionId)}`,
+      `/mastery/${encodeURIComponent(pathId)}/sessions/${encodeURIComponent(
+        newSessionId,
+      )}${courseQuery}`,
       { scroll: false },
     );
   }, [
     currentRouteKey,
+    courseId,
     pathId,
     routeSessionId,
     router,
@@ -194,5 +229,19 @@ export function useMasteryStudySession(
     routeSessionId && sessionResolution?.routeKey !== currentRouteKey,
   );
 
-  return { topic, topicError, knowledgeBases, sessionError, sessionLoading };
+  // The kind actually in force: what the server remembers for an existing
+  // conversation, and what this route asked for while a new one is still
+  // being created.
+  const sessionMode: MasteryMode =
+    (state.masterySessionMode as MasteryMode | null) ||
+    requestedMode;
+
+  return {
+    topic,
+    topicError,
+    knowledgeBases,
+    sessionError,
+    sessionLoading,
+    sessionMode,
+  };
 }

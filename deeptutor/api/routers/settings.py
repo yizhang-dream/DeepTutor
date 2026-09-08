@@ -8,6 +8,7 @@ UI preferences, configuration catalog management, and detailed streamed tests.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import time
@@ -48,8 +49,6 @@ from deeptutor.services.config.settings_draft import (
     merge_draft_secrets,
     redact_draft,
 )
-from deeptutor.services.embedding.client import reset_embedding_client
-from deeptutor.services.llm.client import reset_llm_client
 from deeptutor.services.llm.config import clear_llm_config_cache
 from deeptutor.services.model_selection import list_llm_options
 from deeptutor.services.path_service import get_path_service
@@ -59,6 +58,10 @@ from deeptutor.services.settings.interface_settings import (
 from deeptutor.services.settings.interface_settings import (
     atomic_update,
     resolve_languages,
+    sanitize_enabled_tools,
+)
+from deeptutor.services.settings.interface_settings import (
+    get_enabled_optional_tools as _get_enabled_optional_tools,
 )
 from deeptutor.services.settings.starter_settings import (
     TRACE_COUNT_RANGE as STARTER_TRACE_COUNT_RANGE,
@@ -67,7 +70,7 @@ from deeptutor.tools.builtin import USER_TOGGLEABLE_TOOL_NAMES
 
 router = APIRouter()
 # Public UI-settings router. The app shell bootstraps the interface language
-# from GET /api/v1/settings/ui, and auth pages (/register, /login) must be
+# from GET /api/settings/ui, and auth pages (/register, /login) must be
 # able to do the same *before* a session exists — so this one read endpoint
 # is intentionally mounted outside the ``_auth`` dependency (see main.py).
 # It only exposes non-sensitive UI preferences (theme/language), never the
@@ -75,6 +78,12 @@ router = APIRouter()
 public_router = APIRouter()
 
 TOUR_CACHE = None
+
+
+def get_enabled_optional_tools() -> list[str]:
+    """Compatibility export; the source of truth lives in the service layer."""
+
+    return _get_enabled_optional_tools()
 
 
 def _settings_file():
@@ -88,7 +97,7 @@ def _tour_cache_file():
 
 
 DEFAULT_SIDEBAR_NAV_ORDER = {
-    "start": ["/", "/history", "/knowledge", "/notebook"],
+    "start": ["/", "/history", "/knowledge-bases", "/notebooks"],
     "learnResearch": ["/question", "/solver", "/research", "/co_writer"],
 }
 
@@ -137,7 +146,7 @@ class UISettings(BaseModel):
 
 
 class UISettingsUpdate(BaseModel):
-    """Partial UI settings for user-initiated PATCH/PUT updates via /api/v1/settings/ui.
+    """Partial UI settings for user-initiated PATCH/PUT updates via /api/settings/ui.
 
     All fields have None defaults so `model_dump(exclude_unset=True)` naturally
     excludes fields not provided in the frontend payload, while explicitly provided
@@ -191,6 +200,22 @@ class CatalogPayload(BaseModel):
     catalog: dict[str, Any]
 
 
+class CatalogServicePayload(BaseModel):
+    """One model-catalog service to promote without touching other drafts."""
+
+    service: Literal[
+        "llm",
+        "task",
+        "embedding",
+        "search",
+        "tts",
+        "stt",
+        "imagegen",
+        "videogen",
+    ]
+    config: dict[str, Any]
+
+
 class SettingsDraftPayload(BaseModel):
     """The unapplied settings envelope, as the settings UI holds it."""
 
@@ -209,6 +234,15 @@ class FetchModelsPayload(BaseModel):
     base_url: str = ""
     api_key: Optional[str] = None
     profile_id: Optional[str] = None
+    # Which LLM-shaped service the profile lives in (for resolving a masked key).
+    service: Literal["llm", "task"] = "llm"
+    # The profile's API format; decides whether /models takes Anthropic headers.
+    api_format: Optional[str] = None
+
+
+class ModelCapabilitiesQuery(BaseModel):
+    binding: str = ""
+    model: str = ""
 
 
 class NetworkSettingsUpdate(BaseModel):
@@ -251,7 +285,7 @@ class ChatStarterSettingsUpdate(BaseModel):
 
 
 class MinerUSettingsUpdate(BaseModel):
-    """MinerU PDF-parsing backend settings.
+    """MinerU document-parsing backend settings.
 
     ``api_token`` is tri-state: ``None`` keeps the stored token (the UI sends
     None when the user didn't edit the secret field), ``""`` clears it, and a
@@ -341,6 +375,9 @@ def _invalidate_runtime_caches() -> None:
         "Admin applied catalog; resetting global LLM/embedding clients. "
         "In-flight user turns may flip backend client mid-call."
     )
+    from deeptutor.services.embedding.client import reset_embedding_client
+    from deeptutor.services.llm.client import reset_llm_client
+
     clear_llm_config_cache()
     reset_llm_client()
     reset_embedding_client()
@@ -358,42 +395,13 @@ def load_ui_settings() -> dict[str, Any]:
                 # Filter persisted enabled_optional_tools to current
                 # toggleable set so retired tool names can't leak into
                 # the per-turn payload.
-                merged["enabled_optional_tools"] = _sanitize_enabled_tools(
+                merged["enabled_optional_tools"] = sanitize_enabled_tools(
                     merged.get("enabled_optional_tools")
                 )
                 return merged
         except Exception:
             pass
     return DEFAULT_UI_SETTINGS.copy()
-
-
-def _sanitize_enabled_tools(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return list(USER_TOGGLEABLE_TOOL_NAMES)
-    allowed = set(USER_TOGGLEABLE_TOOL_NAMES)
-    seen: set[str] = set()
-    out: list[str] = []
-    for name in value:
-        if isinstance(name, str) and name in allowed and name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out
-
-
-def get_enabled_optional_tools() -> list[str]:
-    """Return the user's currently-enabled toggleable tool names.
-
-    Source of truth for the chat pipeline when a turn doesn't ship an
-    explicit ``tools`` list. Intersected with the admin grant whitelist so
-    a restricted user's saved toggles can't resurrect a revoked tool.
-    """
-    from deeptutor.multi_user.tool_access import allowed_optional_tools
-
-    enabled = _sanitize_enabled_tools(load_ui_settings().get("enabled_optional_tools"))
-    allowed = allowed_optional_tools()
-    if allowed is not None:
-        enabled = [name for name in enabled if name in allowed]
-    return enabled
 
 
 def save_ui_settings(settings: dict[str, Any]) -> None:
@@ -487,6 +495,20 @@ def _provider_choices() -> dict[str, list[dict[str, Any]]]:
                 ),
                 "base_url": s.default_api_base,
                 "auth_mode": s.auth_mode,
+                "supports_wire_api_selection": s.supports_wire_api_selection,
+                # Which protocols a profile on this vendor may pick, and the
+                # vendor endpoint each one lives at when that differs.
+                "api_formats": list(s.api_formats),
+                "default_api_format": s.default_api_format,
+                "base_urls": {
+                    api_format: s.default_api_base_for(api_format)
+                    for api_format in s.api_formats
+                    if s.default_api_base_for(api_format)
+                },
+                # Legacy entries stay resolvable for stored catalogs but are
+                # not offered for new profiles; the same thing is expressed
+                # today as a provider plus an API format.
+                "status": "legacy" if s.is_legacy else "supported",
             }
             for s in PROVIDERS
         ],
@@ -772,6 +794,30 @@ async def get_openai_codex_oauth_status() -> dict[str, Any]:
     _require_codex_oauth_actor()
     try:
         return get_codex_oauth_service().public_status()
+    except CodexAuthError as exc:
+        raise _codex_http_exception(exc) from None
+
+
+class CodexOAuthCallbackPayload(BaseModel):
+    callback_url: str
+
+
+@router.post("/providers/openai-codex/oauth/complete")
+async def complete_openai_codex_oauth(payload: CodexOAuthCallbackPayload) -> dict[str, Any]:
+    """Finish a waiting Codex login from a callback address the user pasted.
+
+    The provider redirects the browser to a loopback listener. In Docker that
+    listener lives in the container and the published ports do not include it,
+    so the browser shows a failed page while the sign-in waits forever
+    (#1252). This is the way back in without a tunnel: the address is parsed
+    for its OAuth result and discarded, and the exchange is the same one the
+    listener would have driven.
+    """
+    _require_codex_oauth_actor()
+    try:
+        return await get_codex_oauth_service().complete_login_with_callback_url(
+            payload.callback_url
+        )
     except CodexAuthError as exc:
         raise _codex_http_exception(exc) from None
 
@@ -1082,6 +1128,16 @@ async def get_document_parsing_settings():
     return _document_parsing_payload()
 
 
+@router.get("/readiness")
+async def get_settings_readiness():
+    """Return the value-free cross-setting capability readiness matrix."""
+
+    _require_settings_admin()
+    from deeptutor.services.config.readiness import build_settings_readiness
+
+    return await build_settings_readiness()
+
+
 @router.put("/document-parsing")
 async def update_document_parsing_settings(payload: DocumentParsingUpdate):
     _require_settings_admin()
@@ -1273,12 +1329,13 @@ async def start_mineru_models_download(payload: MinerUModelDownloadPayload):
             message = (
                 f"mineru-models-download not found next to the configured CLI "
                 f"(expected {resolved['path']}). The configured install may be "
-                "magic-pdf 1.x — upgrade to MinerU 2.x for one-click downloads."
+                "legacy magic-pdf — upgrade to MinerU >= 3.4.5 for one-click downloads."
             )
         else:
             message = (
                 "mineru-models-download not found on the server PATH. Install "
-                'MinerU 2.x first (uv pip install -U "mineru[core]") or set the CLI path.'
+                'current MinerU first (uv pip install -U "mineru[all]>=3.4.5") or set '
+                "the CLI path."
             )
         return {"ok": False, "message": message}
 
@@ -1322,6 +1379,10 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
             local_cli_probe,
             local_cli_version,
         )
+        from deeptutor.services.parsing.engines.mineru.formats import (
+            MIN_MINERU_VERSION,
+            mineru_version_is_current,
+        )
 
         probe = local_cli_probe(payload.local_cli_path)
         if not probe["found"]:
@@ -1337,7 +1398,7 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
                 "ok": False,
                 "message": (
                     "MinerU CLI not found on the server PATH. Install it "
-                    '(uv pip install -U "mineru[core]"), set an explicit CLI path, '
+                    '(uv pip install -U "mineru[all]>=3.4.5"), set an explicit CLI path, '
                     "or switch to cloud mode."
                 ),
             }
@@ -1347,10 +1408,19 @@ async def test_mineru_connection(payload: MinerUSettingsUpdate):
             probe["path"] if probe.get("source") == "configured" else str(probe["command"])
         )
         version = await asyncio.to_thread(local_cli_version, version_target)
-        detail = version or f"at {probe['path']}"
+        if not mineru_version_is_current(version):
+            detail = version or "an unknown version"
+            return {
+                "ok": False,
+                "message": (
+                    f"Local MinerU CLI reported {detail}. DeepTutor needs MinerU >= "
+                    f"{MIN_MINERU_VERSION}; upgrade with "
+                    f"`pip install -U 'mineru[all]>={MIN_MINERU_VERSION}'`."
+                ),
+            }
         return {
             "ok": True,
-            "message": f"Local MinerU CLI detected: {probe['command']} ({detail})",
+            "message": f"Local MinerU CLI detected: {probe['command']} ({version})",
         }
 
     service = get_runtime_settings_service()
@@ -1399,6 +1469,52 @@ async def update_catalog(payload: CatalogPayload):
     catalog = service.save(proposed)
     _invalidate_runtime_caches()
     return {"catalog": redact_catalog_secrets(catalog)}
+
+
+@router.post("/apply/service")
+async def apply_catalog_service(payload: CatalogServicePayload):
+    """Apply one model service while leaving every other draft untouched.
+
+    Provider dialogs use this narrower commit path for their Done action. A
+    user may still have unrelated edits elsewhere in Settings, and closing an
+    STT dialog must not silently promote those edits too.
+    """
+
+    _require_settings_admin()
+    service = get_model_catalog_service()
+    current = service.load()
+    proposed = deepcopy(current)
+    proposed.setdefault("services", {})[payload.service] = deepcopy(payload.config)
+    restored = restore_catalog_secrets(proposed, current)
+    reconciled = reconcile_codex_catalog_update(current, restored)
+    runtime = service.apply(reconciled)
+    catalog = service.load()
+
+    # A previously saved draft contains a full catalog. Keep it, but advance
+    # this one service to the value that is now live; otherwise reloading the
+    # page would resurrect the pre-apply STT configuration over the live one.
+    draft_service = get_settings_draft_service()
+    stored_draft = draft_service.load()
+    draft_catalog = stored_draft.get("catalog")
+    if isinstance(draft_catalog, dict):
+        draft_catalog.setdefault("services", {})[payload.service] = deepcopy(
+            catalog["services"][payload.service]
+        )
+        stored_draft["catalog"] = None if draft_catalog == catalog else draft_catalog
+
+    if is_empty_draft(stored_draft):
+        draft_service.clear()
+        public_draft = None
+    else:
+        public_draft = redact_draft(draft_service.save(stored_draft))
+
+    _invalidate_runtime_caches()
+    return {
+        "message": f"{payload.service} settings applied to runtime.",
+        "catalog": redact_catalog_secrets(catalog),
+        "draft": public_draft,
+        "runtime": runtime,
+    }
 
 
 @router.get("/draft")
@@ -1493,20 +1609,20 @@ async def fetch_models_from_provider(payload: FetchModelsPayload):
         )
 
     api_key = payload.api_key
-    if api_key == CATALOG_SECRET_MASK and payload.profile_id:
-        llm_service = get_model_catalog_service().load().get("services", {}).get("llm", {})
+    api_format = (payload.api_format or "").strip().lower()
+    if payload.profile_id and (api_key == CATALOG_SECRET_MASK or not api_format):
+        service = get_model_catalog_service().load().get("services", {}).get(payload.service, {})
         profile = next(
-            (
-                item
-                for item in llm_service.get("profiles", [])
-                if item.get("id") == payload.profile_id
-            ),
+            (item for item in service.get("profiles", []) if item.get("id") == payload.profile_id),
             None,
         )
-        api_key = profile.get("api_key") if profile else None
+        if api_key == CATALOG_SECRET_MASK:
+            api_key = profile.get("api_key") if profile else None
+        if not api_format and profile:
+            api_format = str(profile.get("api_format") or "")
 
     try:
-        model_ids = await fetch_llm_models(binding, base_url, api_key)
+        model_ids = await fetch_llm_models(binding, base_url, api_key, api_format or "auto")
     except Exception as exc:  # noqa: BLE001 — surface any provider error as 502
         logger.exception("Failed to fetch models from %s", base_url)
         raise HTTPException(
@@ -1515,6 +1631,25 @@ async def fetch_models_from_provider(payload: FetchModelsPayload):
         ) from exc
 
     return {"models": [{"id": model_id, "name": model_id} for model_id in model_ids]}
+
+
+@router.post("/model-capabilities")
+async def resolve_model_capabilities(payload: ModelCapabilitiesQuery):
+    """What the built-in capability tables assume for one provider/model pair.
+
+    The settings UI shows these as the value "Auto" resolves to next to each
+    per-model override, so a user can see what they are overriding.
+    """
+    _require_settings_admin()
+    from deeptutor.services.llm.capabilities import effective_capabilities
+
+    binding = (payload.binding or "").strip().lower() or "openai"
+    model = (payload.model or "").strip()
+    return {
+        "binding": binding,
+        "model": model,
+        "defaults": effective_capabilities(binding, model),
+    }
 
 
 @router.put("/theme")
@@ -1635,7 +1770,7 @@ async def update_sidebar_nav_order(update: SidebarNavOrderUpdate):
 
 @router.put("/enabled-tools")
 async def update_enabled_tools(update: EnabledToolsUpdate):
-    sanitized = _sanitize_enabled_tools(update.enabled_tools)
+    sanitized = sanitize_enabled_tools(update.enabled_tools)
     patch_ui_settings(enabled_optional_tools=sanitized)
     return {"enabled_optional_tools": sanitized}
 

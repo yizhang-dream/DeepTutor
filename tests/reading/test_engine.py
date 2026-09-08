@@ -275,6 +275,59 @@ def test_position_round_trip_validates_locator_and_anchor(
         store.save_position(manifest.material_id, ReadingPosition(locator=99))
 
 
+def test_bookmarks_are_plural_deliberate_and_deduplicated_by_locator(
+    store: ReadingStore, tmp_path: Path
+) -> None:
+    """Unlike the position, these are chosen — several of them, by id."""
+    manifest = store.ingest(_write_epub(tmp_path / "book.epub"))
+    material_id = manifest.material_id
+
+    assert store.bookmarks(material_id) == []
+
+    second = store.add_bookmark(material_id, 2, "the good bit")
+    first = store.add_bookmark(material_id, 1)
+
+    assert second.label == "the good bit"
+    # Saving a place must not force the reader to name it first.
+    assert first.label == ""
+    assert first.bookmark_id != second.bookmark_id
+
+    # Reading order, not insertion order: the list is an index, not a log.
+    assert [row.locator for row in store.bookmarks(material_id)] == [1, 2]
+
+    # The affordance is a toggle on the reader's toolbar, so "bookmark this
+    # page" when the page is already bookmarked is the existing bookmark —
+    # not a second identical row.
+    again = store.add_bookmark(material_id, 2, "ignored")
+    assert again.bookmark_id == second.bookmark_id
+    assert again.label == "the good bit"
+    assert len(store.bookmarks(material_id)) == 2
+
+    with pytest.raises(ReadingError):
+        store.add_bookmark(material_id, 99)
+
+    assert store.delete_bookmark(material_id, second.bookmark_id) is True
+    assert store.delete_bookmark(material_id, second.bookmark_id) is False
+    assert [row.locator for row in store.bookmarks(material_id)] == [1]
+
+
+def test_bookmarks_survive_a_compatible_reingest(store: ReadingStore, tmp_path: Path) -> None:
+    """A bookmark is a place the reader chose, so a repair keeps it.
+
+    The automatic viewport is allowed to reset when the spine changes under
+    it; a deliberately-kept place is user-owned state like an annotation.
+    """
+    source = _write_epub(tmp_path / "book.epub")
+    manifest = store.ingest(source)
+    kept = store.add_bookmark(manifest.material_id, 2, "chapter two")
+
+    reingested = store.ingest(source)
+
+    rows = store.bookmarks(reingested.material_id)
+    assert [row.bookmark_id for row in rows] == [kept.bookmark_id]
+    assert rows[0].label == "chapter two"
+
+
 def _downgrade_epub_manifest_to_legacy_text(store: ReadingStore, material_id: str) -> None:
     material_dir = store.root / material_id
     manifest_path = material_dir / "manifest.json"
@@ -439,6 +492,7 @@ def test_annotations_round_trip_with_generated_ids(store: ReadingStore, pdf_path
     )
 
     assert saved.annotation_id
+    assert saved.material_revision == manifest.revision
     stored = store.annotations(manifest.material_id)
     assert len(stored) == 1
     assert stored[0].rects[0].to_list() == [0.1, 0.2, 0.5, 0.25]
@@ -886,6 +940,24 @@ def test_markdown_export_lists_marks_in_locator_order(store: ReadingStore, pdf_p
     assert text.index("Page 1") < text.index("Page 3")
     assert "> Introduction" in text
     assert "first" in text
+
+
+def test_markdown_export_labels_saved_citations(store: ReadingStore, pdf_path: Path) -> None:
+    manifest = store.ingest(pdf_path)
+    store.save_annotation(
+        manifest.material_id,
+        Annotation(
+            annotation_id="",
+            locator=1,
+            kind="citation",
+            quote="Introduction",
+        ),
+    )
+
+    text = export_material(store, manifest.material_id, fmt="markdown").data.decode("utf-8")
+
+    assert "**Citation**" in text
+    assert "> Introduction" in text
 
 
 def test_markdown_export_handles_a_material_with_no_annotations(

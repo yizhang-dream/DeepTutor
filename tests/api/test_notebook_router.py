@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 from pathlib import Path
 
@@ -14,12 +15,13 @@ notebook_router = importlib.import_module("deeptutor.api.routers.question_notebo
 sessions_router = importlib.import_module("deeptutor.api.routers.sessions").router
 
 from deeptutor.services.session.sqlite_store import SQLiteSessionStore
+from deeptutor.services.storage.attachment_store import LocalDiskAttachmentStore
 
 
 def _build_app(store: SQLiteSessionStore) -> FastAPI:
     app = FastAPI()
-    app.include_router(notebook_router, prefix="/api/v1/question-notebook")
-    app.include_router(sessions_router, prefix="/api/v1/sessions")
+    app.include_router(notebook_router, prefix="/api/question-notebook")
+    app.include_router(sessions_router, prefix="/api/sessions")
     return app
 
 
@@ -102,9 +104,55 @@ def _make_course_items(*questions: tuple[str, str, bool]) -> list[dict]:
 
 def test_list_entries_empty(store: SQLiteSessionStore) -> None:
     with TestClient(_build_app(store)) as client:
-        resp = client.get("/api/v1/question-notebook/entries")
+        resp = client.get("/api/question-notebook/entries")
         assert resp.status_code == 200
         assert resp.json() == {"items": [], "total": 0}
+
+
+def test_upsert_entry_persists_base64_answer_image(
+    store: SQLiteSessionStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = asyncio.run(store.create_session(title="Image answer"))
+    attachment_store = LocalDiskAttachmentStore(root=tmp_path / "attachments")
+    monkeypatch.setattr(
+        "deeptutor.api.routers.question_notebook.get_attachment_store",
+        lambda: attachment_store,
+    )
+
+    with TestClient(_build_app(store)) as client:
+        response = client.post(
+            "/api/question-notebook/entries/upsert",
+            json={
+                "session_id": session["id"],
+                "question_id": "image-question",
+                "question": "Identify the diagram.",
+                "user_answer_images": [
+                    {
+                        "id": "answer-image-1",
+                        "base64": base64.b64encode(b"image-bytes").decode("ascii"),
+                        "filename": "answer.png",
+                        "mime_type": "image/png",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["user_answer_images"] == [
+        {
+            "id": "answer-image-1",
+            "url": (f"/files/attachments/{session['id']}/answer-image-1/answer.png"),
+            "filename": "answer.png",
+            "mime_type": "image/png",
+        }
+    ]
+    stored_path = attachment_store.resolve_path(
+        session_id=session["id"],
+        attachment_id="answer-image-1",
+        filename="answer.png",
+    )
+    assert stored_path is not None
+    assert stored_path.read_bytes() == b"image-bytes"
 
 
 def test_list_entries_filters_by_course_and_total(
@@ -128,7 +176,7 @@ def test_list_entries_filters_by_course_and_total(
 
     with TestClient(_build_app(store)) as client:
         response = client.get(
-            "/api/v1/question-notebook/entries",
+            "/api/question-notebook/entries",
             params={"course_id": course_a.id},
         )
 
@@ -153,7 +201,7 @@ def test_list_entries_for_course_without_sessions_is_empty(
 
     with TestClient(_build_app(store)) as client:
         response = client.get(
-            "/api/v1/question-notebook/entries",
+            "/api/question-notebook/entries",
             params={"course_id": empty_course.id},
         )
 
@@ -176,7 +224,7 @@ def test_list_entries_without_course_id_remains_unfiltered(store: SQLiteSessionS
     )
 
     with TestClient(_build_app(store)) as client:
-        response = client.get("/api/v1/question-notebook/entries")
+        response = client.get("/api/question-notebook/entries")
 
     assert response.status_code == 200
     body = response.json()
@@ -187,7 +235,7 @@ def test_list_entries_without_course_id_remains_unfiltered(store: SQLiteSessionS
 def test_list_entries_missing_course_returns_404(store: SQLiteSessionStore, course_service) -> None:
     with TestClient(_build_app(store)) as client:
         response = client.get(
-            "/api/v1/question-notebook/entries",
+            "/api/question-notebook/entries",
             params={"course_id": "course-missing"},
         )
 
@@ -201,7 +249,7 @@ def test_quiz_results_populates_notebook(store: SQLiteSessionStore) -> None:
 
     with TestClient(_build_app(store)) as client:
         resp = client.post(
-            f"/api/v1/sessions/{sid}/quiz-results",
+            f"/api/sessions/{sid}/quiz-results",
             json={"answers": _quiz_answers()},
         )
         assert resp.status_code == 200
@@ -210,7 +258,7 @@ def test_quiz_results_populates_notebook(store: SQLiteSessionStore) -> None:
         assert body["notebook_count"] == 2
         assert "[Quiz Performance]" in body["content"]
 
-        listing = client.get("/api/v1/question-notebook/entries")
+        listing = client.get("/api/question-notebook/entries")
         assert listing.status_code == 200
         items = listing.json()["items"]
         assert len(items) == 2
@@ -221,13 +269,13 @@ def test_quiz_results_upserts_on_retry(store: SQLiteSessionStore) -> None:
     sid = session["id"]
 
     with TestClient(_build_app(store)) as client:
-        client.post(f"/api/v1/sessions/{sid}/quiz-results", json={"answers": _quiz_answers()})
+        client.post(f"/api/sessions/{sid}/quiz-results", json={"answers": _quiz_answers()})
         updated = _quiz_answers()
         updated[0]["user_answer"] = "B"
         updated[0]["is_correct"] = True
-        client.post(f"/api/v1/sessions/{sid}/quiz-results", json={"answers": updated})
+        client.post(f"/api/sessions/{sid}/quiz-results", json={"answers": updated})
 
-        listing = client.get("/api/v1/question-notebook/entries").json()
+        listing = client.get("/api/question-notebook/entries").json()
         assert listing["total"] == 2
         q1 = next(e for e in listing["items"] if e["question_id"] == "q1")
         assert q1["is_correct"] is True
@@ -252,16 +300,16 @@ def test_bookmark_toggle(store: SQLiteSessionStore) -> None:
 
     with TestClient(_build_app(store)) as client:
         resp = client.patch(
-            f"/api/v1/question-notebook/entries/{eid}",
+            f"/api/question-notebook/entries/{eid}",
             json={"bookmarked": True},
         )
         assert resp.status_code == 200
 
-        bm = client.get("/api/v1/question-notebook/entries?bookmarked=true").json()
+        bm = client.get("/api/question-notebook/entries?bookmarked=true").json()
         assert bm["total"] == 1
 
-        client.patch(f"/api/v1/question-notebook/entries/{eid}", json={"bookmarked": False})
-        bm2 = client.get("/api/v1/question-notebook/entries?bookmarked=true").json()
+        client.patch(f"/api/question-notebook/entries/{eid}", json={"bookmarked": False})
+        bm2 = client.get("/api/question-notebook/entries?bookmarked=true").json()
         assert bm2["total"] == 0
 
 
@@ -282,8 +330,8 @@ def test_delete_entry(store: SQLiteSessionStore) -> None:
     eid = asyncio.run(store.list_notebook_entries())["items"][0]["id"]
 
     with TestClient(_build_app(store)) as client:
-        assert client.delete(f"/api/v1/question-notebook/entries/{eid}").status_code == 200
-        assert client.delete(f"/api/v1/question-notebook/entries/{eid}").status_code == 404
+        assert client.delete(f"/api/question-notebook/entries/{eid}").status_code == 200
+        assert client.delete(f"/api/question-notebook/entries/{eid}").status_code == 404
 
 
 def test_category_crud_and_association(store: SQLiteSessionStore) -> None:
@@ -304,36 +352,36 @@ def test_category_crud_and_association(store: SQLiteSessionStore) -> None:
 
     with TestClient(_build_app(store)) as client:
         cat_resp = client.post(
-            "/api/v1/question-notebook/categories",
+            "/api/question-notebook/categories",
             json={"name": "Math"},
         )
         assert cat_resp.status_code == 201
         cat_id = cat_resp.json()["id"]
 
-        cats = client.get("/api/v1/question-notebook/categories").json()
+        cats = client.get("/api/question-notebook/categories").json()
         assert len(cats) == 1
         assert cats[0]["name"] == "Math"
 
         add_resp = client.post(
-            f"/api/v1/question-notebook/entries/{eid}/categories",
+            f"/api/question-notebook/entries/{eid}/categories",
             json={"category_id": cat_id},
         )
         assert add_resp.status_code == 200
 
-        by_cat = client.get(f"/api/v1/question-notebook/entries?category_id={cat_id}").json()
+        by_cat = client.get(f"/api/question-notebook/entries?category_id={cat_id}").json()
         assert by_cat["total"] == 1
 
-        rm_resp = client.delete(f"/api/v1/question-notebook/entries/{eid}/categories/{cat_id}")
+        rm_resp = client.delete(f"/api/question-notebook/entries/{eid}/categories/{cat_id}")
         assert rm_resp.status_code == 200
-        by_cat2 = client.get(f"/api/v1/question-notebook/entries?category_id={cat_id}").json()
+        by_cat2 = client.get(f"/api/question-notebook/entries?category_id={cat_id}").json()
         assert by_cat2["total"] == 0
 
-        client.patch(f"/api/v1/question-notebook/categories/{cat_id}", json={"name": "Algebra"})
-        cats2 = client.get("/api/v1/question-notebook/categories").json()
+        client.patch(f"/api/question-notebook/categories/{cat_id}", json={"name": "Algebra"})
+        cats2 = client.get("/api/question-notebook/categories").json()
         assert cats2[0]["name"] == "Algebra"
 
-        client.delete(f"/api/v1/question-notebook/categories/{cat_id}")
-        assert client.get("/api/v1/question-notebook/categories").json() == []
+        client.delete(f"/api/question-notebook/categories/{cat_id}")
+        assert client.get("/api/question-notebook/categories").json() == []
 
 
 def test_lookup_entry_by_question(store: SQLiteSessionStore) -> None:
@@ -353,14 +401,14 @@ def test_lookup_entry_by_question(store: SQLiteSessionStore) -> None:
 
     with TestClient(_build_app(store)) as client:
         resp = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": session["id"], "question_id": "q1"},
         )
         assert resp.status_code == 200
         assert resp.json()["question_id"] == "q1"
 
         resp404 = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": session["id"], "question_id": "nope"},
         )
         assert resp404.status_code == 404
@@ -377,7 +425,7 @@ def test_quiz_state_isolated_per_turn(store: SQLiteSessionStore) -> None:
     with TestClient(_build_app(store)) as client:
         first = _quiz_answers()
         resp1 = client.post(
-            f"/api/v1/sessions/{sid}/quiz-results",
+            f"/api/sessions/{sid}/quiz-results",
             json={"answers": first, "turn_id": "turn_A"},
         )
         assert resp1.status_code == 200
@@ -387,19 +435,19 @@ def test_quiz_state_isolated_per_turn(store: SQLiteSessionStore) -> None:
         second[0]["user_answer"] = ""
         second[0]["is_correct"] = False
         resp2 = client.post(
-            f"/api/v1/sessions/{sid}/quiz-results",
+            f"/api/sessions/{sid}/quiz-results",
             json={"answers": second, "turn_id": "turn_B"},
         )
         assert resp2.status_code == 200
         assert resp2.json()["notebook_count"] == 2
 
-        listing = client.get("/api/v1/question-notebook/entries").json()
+        listing = client.get("/api/question-notebook/entries").json()
         assert listing["total"] == 4
 
         # Looking up q1 scoped to the first turn returns the first quiz's
         # answer, not the second.
         scoped_a = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "q1", "turn_id": "turn_A"},
         )
         assert scoped_a.status_code == 200
@@ -408,7 +456,7 @@ def test_quiz_state_isolated_per_turn(store: SQLiteSessionStore) -> None:
 
         # The second turn has no recorded answer for q1.
         scoped_b = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "q1", "turn_id": "turn_B"},
         )
         assert scoped_b.status_code == 200
@@ -444,7 +492,7 @@ def test_lookup_without_turn_id_only_matches_legacy_namespace(
     with TestClient(_build_app(store)) as client:
         # Turn-scoped rows are invisible without their turn_id.
         resp = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "q1"},
         )
         assert resp.status_code == 404
@@ -465,7 +513,7 @@ def test_lookup_without_turn_id_only_matches_legacy_namespace(
             )
         )
         legacy = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "q1"},
         )
         assert legacy.status_code == 200
@@ -478,7 +526,7 @@ def test_lookup_missing_entry_returns_404_by_default(store: SQLiteSessionStore) 
     sid = session["id"]
     with TestClient(_build_app(store)) as client:
         resp = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "absent"},
         )
         assert resp.status_code == 404
@@ -489,7 +537,7 @@ def test_lookup_missing_entry_returns_204_when_missing_ok(store: SQLiteSessionSt
     sid = session["id"]
     with TestClient(_build_app(store)) as client:
         resp = client.get(
-            "/api/v1/question-notebook/entries/lookup/by-question",
+            "/api/question-notebook/entries/lookup/by-question",
             params={"session_id": sid, "question_id": "absent", "missing_ok": "true"},
         )
         assert resp.status_code == 204

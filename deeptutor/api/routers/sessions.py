@@ -17,6 +17,9 @@ from deeptutor.services.session.organization import (
     list_all_sessions_snapshot,
     validate_parent_assignment,
 )
+from deeptutor.services.session.provider_response_state import (
+    redact_private_message_metadata as _redact_provider_state_metadata,
+)
 from deeptutor.services.storage.attachment_store import get_attachment_store
 
 logger = logging.getLogger(__name__)
@@ -113,6 +116,11 @@ _TRUNCATION_NOTICE = "\n\n[... content truncated]"
 _TRUNCATABLE_EVENT_TYPES = ("tool_result", "observation")
 
 
+def _redact_private_message_metadata(messages: list[dict[str, Any]]) -> None:
+    """Remove provider-only state before session details cross the API."""
+    _redact_provider_state_metadata(messages)
+
+
 def _truncate_oversized_events(
     messages: list[dict[str, Any]], limit: int = MAX_EVENT_PAYLOAD
 ) -> None:
@@ -152,8 +160,23 @@ async def get_session(session_id: str):
     session = await store.get_session_with_messages(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _redact_private_message_metadata(session.get("messages", []))
     _truncate_oversized_events(session.get("messages", []))
     return session
+
+
+@router.get("/{session_id}/messages/{message_id}/events")
+async def get_message_events(
+    session_id: str,
+    message_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=1000),
+):
+    store = get_session_store()
+    trace = await store.get_message_trace(session_id, message_id, after_seq, limit)
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return trace
 
 
 @router.get("/{session_id}/ask-hint")

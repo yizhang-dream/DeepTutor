@@ -39,7 +39,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Literal, Mapping, Sequence
 import uuid
 
 from deeptutor.reading.extract import extract_material, synthesise_outline
@@ -49,6 +49,7 @@ from deeptutor.reading.models import (
     MaterialManifest,
     MaterialNotFound,
     OutlineEntry,
+    ReadingBookmark,
     ReadingError,
     ReadingPosition,
     ReadingUpgradeConflict,
@@ -56,6 +57,7 @@ from deeptutor.reading.models import (
     TextQuoteSelector,
     UnitReference,
 )
+from deeptutor.services.file_io import atomic_write_text as _atomic_write
 from deeptutor.services.path_service import get_path_service
 
 logger = logging.getLogger(__name__)
@@ -66,11 +68,17 @@ ANNOTATIONS_NAME = "annotations.json"
 POSITION_NAME = "position.json"
 ANNOTATIONS_DIR = "annotations"
 POSITIONS_DIR = "positions"
+BOOKMARKS_DIR = "bookmarks"
+# A ceiling rather than a design limit: bookmarks are a short list a reader
+# scans, and the file is rewritten whole on every change.
+MAX_BOOKMARKS = 200
 UNIT_REFS_NAME = "unit_refs.json"
 UNITS_DIR = "units"
 RAW_DIR = "raw"
 MEDIA_DIR = "media"
 MEDIA_INDEX_NAME = "media.json"
+ASSETS_DIR = "assets"
+REVISIONS_DIR = "revisions"
 
 # Both content hashes and separately minted catalog ids are path-safe. Content
 # directories themselves remain hashes only.
@@ -114,17 +122,6 @@ def _quote_context_matches(
     return (not wanted_prefix or preceding.endswith(wanted_prefix)) and (
         not wanted_suffix or following.startswith(wanted_suffix)
     )
-
-
-def _atomic_write(path: Path, payload: str) -> None:
-    """Write *payload* to *path* atomically within the same directory."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.name}.{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> Any:
@@ -338,7 +335,11 @@ class ReadingStore:
             # legacy upgrades with annotations were rejected above because
             # their old locators cannot be mapped safely to the spine.
             state_names: tuple[str, ...] = (ANNOTATIONS_NAME, POSITION_NAME)
-            state_dirs: tuple[str, ...] = (ANNOTATIONS_DIR, POSITIONS_DIR)
+            state_dirs: tuple[str, ...] = (
+                ANNOTATIONS_DIR,
+                POSITIONS_DIR,
+                BOOKMARKS_DIR,
+            )
             if existing is not None and existing.render_mode != "epub":
                 # A legacy text-reader position can point past the shorter
                 # source-faithful spine. Annotations are protected above;
@@ -346,7 +347,10 @@ class ReadingStore:
                 # drop the per-material viewports too, not just the legacy
                 # file, or the stale locator simply survives in the new path.
                 state_names = (ANNOTATIONS_NAME,)
-                state_dirs = (ANNOTATIONS_DIR,)
+                # A bookmark is a place the reader chose, so it is kept for the
+                # same reason an annotation is; only the automatic viewport
+                # resets when the spine changes under it.
+                state_dirs = (ANNOTATIONS_DIR, BOOKMARKS_DIR)
             for state_name in state_names:
                 source_state = material_dir / state_name
                 if source_state.is_file():
@@ -391,6 +395,11 @@ class ReadingStore:
         raw_data: bytes | None = None,
         outline: Sequence[OutlineEntry] | None = None,
         unit_refs: Sequence[UnitReference] = (),
+        content_format: Literal["plain_text", "web_markdown"] = "plain_text",
+        source_type: str = "upload",
+        source_url: str = "",
+        assets: Mapping[str, bytes] | None = None,
+        carry_source: bool = False,
     ) -> MaterialManifest:
         """Install trusted, already-extracted units (web pages and transcripts).
 
@@ -408,8 +417,11 @@ class ReadingStore:
             raise ReadingError(f"unsupported reading unit: {unit}")
         if render_mode not in {"text", "pdf", "epub", "video", "audio"}:
             raise ReadingError(f"unsupported render mode: {render_mode}")
+        if content_format not in {"plain_text", "web_markdown"}:
+            raise ReadingError(f"unsupported content format: {content_format}")
         remote_video = render_mode == "video" and extractor.startswith(("youtube-", "bilibili-"))
-        if render_mode != "text" and not raw_data and not remote_video:
+        carried = carry_source and self._has_raw(material_id)
+        if render_mode != "text" and not raw_data and not remote_video and not carried:
             raise ReadingError(f"{render_mode} materials require playable source bytes")
 
         display_name = (filename or "material").strip() or "material"
@@ -422,10 +434,24 @@ class ReadingStore:
             for index, text in enumerate(clean_units, start=1):
                 self._unit_file(stage_dir, index).write_text(text, encoding="utf-8")
 
+            if assets:
+                assets_dir = stage_dir / ASSETS_DIR
+                assets_dir.mkdir(parents=True, exist_ok=True)
+                for name, data in assets.items():
+                    safe_name = _safe_filename(str(name), fallback="asset")
+                    (assets_dir / safe_name).write_bytes(bytes(data))
+            elif carry_source:
+                _carry_dir(material_dir / ASSETS_DIR, stage_dir / ASSETS_DIR)
+
             if raw_data is not None:
                 raw_dir = stage_dir / RAW_DIR
                 raw_dir.mkdir(parents=True, exist_ok=True)
                 (raw_dir / _safe_filename(display_name, fallback="material")).write_bytes(raw_data)
+            elif carry_source:
+                # Re-ingesting the *same* bytes with better text — a transcript
+                # replacing its placeholder. Linking beats re-reading a
+                # multi-hundred-megabyte upload back through memory.
+                _carry_dir(material_dir / RAW_DIR, stage_dir / RAW_DIR)
 
             resolved_outline = tuple(outline or synthesise_outline(clean_units))
             _atomic_write(
@@ -445,21 +471,48 @@ class ReadingStore:
                 title=(title or Path(display_name).stem).strip(),
                 source_hash=content_id,
                 extractor=extractor,
-                byte_size=len(raw_data or b""),
+                byte_size=(
+                    len(raw_data)
+                    if raw_data is not None
+                    else (existing.byte_size if carry_source and existing else 0)
+                ),
                 char_count=sum(len(value) for value in clean_units),
                 created_at=existing.created_at if existing else time.time(),
                 has_raw_view=render_mode == "pdf",
                 render_mode=render_mode,  # type: ignore[arg-type]
+                content_format=content_format,
+                source_type=source_type,
+                source_url=source_url,
+                revision=(existing.revision + 1 if existing else 1),
             )
             _atomic_write(
                 stage_dir / MANIFEST_NAME,
                 json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2),
             )
+            if existing is not None and material_dir.is_dir():
+                previous_revisions = material_dir / REVISIONS_DIR
+                if previous_revisions.is_dir():
+                    shutil.copytree(
+                        previous_revisions,
+                        stage_dir / REVISIONS_DIR,
+                        dirs_exist_ok=True,
+                    )
+                revision_dir = stage_dir / REVISIONS_DIR / f"{existing.revision:06d}"
+                if not revision_dir.exists():
+                    revision_dir.mkdir(parents=True, exist_ok=True)
+                    for filename in (MANIFEST_NAME, OUTLINE_NAME, UNIT_REFS_NAME):
+                        source = material_dir / filename
+                        if source.is_file():
+                            shutil.copy2(source, revision_dir / filename)
+                    for dirname in (UNITS_DIR, ASSETS_DIR):
+                        source_dir = material_dir / dirname
+                        if source_dir.is_dir():
+                            shutil.copytree(source_dir, revision_dir / dirname)
             for state_name in (ANNOTATIONS_NAME, POSITION_NAME):
                 source_state = material_dir / state_name
                 if source_state.is_file():
                     shutil.copy2(source_state, stage_dir / state_name)
-            for state_dir in (ANNOTATIONS_DIR, POSITIONS_DIR):
+            for state_dir in (ANNOTATIONS_DIR, POSITIONS_DIR, BOOKMARKS_DIR):
                 source_state_dir = material_dir / state_dir
                 if source_state_dir.is_dir():
                     shutil.copytree(
@@ -480,6 +533,40 @@ class ReadingStore:
                 shutil.rmtree(stage_dir, ignore_errors=True)
                 shutil.rmtree(backup_dir, ignore_errors=True)
             return self.manifest(material_id)
+
+    def revisions(self, material_id: str) -> list[MaterialManifest]:
+        """List immutable prior manifests, oldest first."""
+        self.manifest(material_id)
+        root = self._dir(material_id) / REVISIONS_DIR
+        if not root.is_dir():
+            return []
+        rows: list[MaterialManifest] = []
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or not re.fullmatch(r"\d{6}", child.name):
+                continue
+            data = _read_json(child / MANIFEST_NAME)
+            if isinstance(data, dict):
+                rows.append(MaterialManifest.from_dict(data))
+        return rows
+
+    def revision_unit_text(self, material_id: str, revision: int, locator: int) -> str:
+        """Read a unit from a preserved prior web-snapshot revision."""
+        self.manifest(material_id)
+        if revision < 1 or locator < 1:
+            raise ReadingError("revision and locator must be positive")
+        revision_dir = self._dir(material_id) / REVISIONS_DIR / f"{revision:06d}"
+        data = _read_json(revision_dir / MANIFEST_NAME)
+        if not isinstance(data, dict):
+            raise MaterialNotFound(f"revision {revision} not found")
+        manifest = MaterialManifest.from_dict(data)
+        if locator > manifest.unit_count:
+            raise ReadingError(
+                f"{manifest.unit} {locator} is out of range for revision {revision}."
+            )
+        path = self._unit_file(revision_dir, locator)
+        if not path.is_file():
+            raise MaterialNotFound(f"revision {revision} unit {locator} not found")
+        return path.read_text(encoding="utf-8")
 
     def _is_complete(self, material_id: str, manifest: MaterialManifest) -> bool:
         """Whether a previously ingested material is still fully on disk."""
@@ -660,6 +747,13 @@ class ReadingStore:
         path = self._dir(material_id) / MEDIA_DIR / clean
         return path if path.is_file() else None
 
+    def _has_raw(self, material_id: str) -> bool:
+        """Whether original bytes are already on disk, without loading them."""
+        try:
+            content_id = self._content_id(material_id)
+        except ReadingError:
+            return False
+        return self._find_raw(self._dir(content_id)) is not None
 
     def unit_references(self, material_id: str) -> list[UnitReference]:
         """Source-native addresses aligned with the numeric locator space."""
@@ -709,6 +803,20 @@ class ReadingStore:
             if candidate.is_file():
                 return candidate
         return None
+
+    def asset_path(self, material_id: str, asset_name: str) -> Path | None:
+        """Resolve one generated raster without permitting traversal.
+
+        Web snapshots name their images by content hash; media imports store a
+        single poster frame under a fixed name. Both are server-generated, and
+        the pattern is what keeps a request from walking out of the directory.
+        """
+        self.manifest(material_id)
+        name = str(asset_name or "").strip().lower()
+        if not re.fullmatch(r"(?:[0-9a-f]{20}|cover)\.(?:png|jpg|gif|webp)", name):
+            return None
+        path = self._dir(material_id) / ASSETS_DIR / name
+        return path if path.is_file() else None
 
     @contextmanager
     def staged_delete(self, material_id: str) -> Iterator[bool]:
@@ -875,6 +983,7 @@ class ReadingStore:
             if index is None:
                 stored = dataclass_replace(
                     stored,
+                    material_revision=manifest.revision,
                     created_at=stored.created_at or now,
                     updated_at=now,
                 )
@@ -882,12 +991,89 @@ class ReadingStore:
             else:
                 stored = dataclass_replace(
                     stored,
+                    material_revision=existing[index].material_revision,
                     created_at=existing[index].created_at or now,
                     updated_at=now,
                 )
                 existing[index] = stored
             self._write_annotations(material_id, existing)
             return stored
+
+    # -- bookmarks ---------------------------------------------------------
+
+    def bookmarks(self, material_id: str) -> list[ReadingBookmark]:
+        """Every kept place in this material, in reading order."""
+        self.manifest(material_id)
+        rows = _read_json(self._state_path(material_id, BOOKMARKS_DIR))
+        if not isinstance(rows, list):
+            return []
+        parsed = [
+            ReadingBookmark.from_dict(row)
+            for row in rows
+            if isinstance(row, dict) and row.get("bookmark_id")
+        ]
+        return sorted(parsed, key=lambda row: (row.locator, row.created_at))
+
+    def add_bookmark(
+        self,
+        material_id: str,
+        locator: int,
+        label: str = "",
+        source_anchor: str = "",
+    ) -> ReadingBookmark:
+        """Keep one place, or return the one already kept for that locator.
+
+        Idempotent per locator on purpose: the affordance is a toggle on the
+        reader's own toolbar, so the honest answer to "bookmark this page"
+        when the page is already bookmarked is the existing bookmark, not a
+        second identical row in the list.
+        """
+        manifest = self.manifest(material_id)
+        target = int(locator)
+        if not 1 <= target <= manifest.unit_count:
+            raise ReadingError(
+                f"{manifest.unit} {target} is out of range — "
+                f"this material has {manifest.unit_count}."
+            )
+        trimmed = str(label or "").strip()[:200]
+        anchor_value = str(source_anchor or "")[:4096]
+        with self._locked(material_id):
+            existing = self.bookmarks(material_id)
+            for row in existing:
+                if row.locator == target:
+                    return row
+            if len(existing) >= MAX_BOOKMARKS:
+                raise ReadingError(
+                    f"this material already has {MAX_BOOKMARKS} bookmarks — "
+                    "remove one before adding another."
+                )
+            created = ReadingBookmark(
+                bookmark_id=f"bm_{uuid.uuid4().hex[:12]}",
+                locator=target,
+                label=trimmed,
+                source_anchor=anchor_value,
+            )
+            self._write_bookmarks(material_id, [*existing, created])
+            return created
+
+    def delete_bookmark(self, material_id: str, bookmark_id: str) -> bool:
+        self.manifest(material_id)
+        target = str(bookmark_id or "").strip()
+        if not target:
+            return False
+        with self._locked(material_id):
+            existing = self.bookmarks(material_id)
+            remaining = [row for row in existing if row.bookmark_id != target]
+            if len(remaining) == len(existing):
+                return False
+            self._write_bookmarks(material_id, remaining)
+            return True
+
+    def _write_bookmarks(self, material_id: str, rows: Sequence[ReadingBookmark]) -> None:
+        _atomic_write(
+            self._state_path(material_id, BOOKMARKS_DIR),
+            json.dumps([row.to_dict() for row in rows], ensure_ascii=False, indent=2),
+        )
 
     def delete_annotation(self, material_id: str, annotation_id: str) -> bool:
         self.manifest(material_id)
@@ -901,6 +1087,28 @@ class ReadingStore:
                 return False
             self._write_annotations(material_id, remaining)
             return True
+
+
+def _carry_dir(source: Path, target: Path) -> None:
+    """Bring a previous revision's directory into the staging copy.
+
+    Hard links first: the payload here is the untouched original upload, so
+    copying it would double a large file on disk for no reason. Falls back to a
+    real copy across filesystems, where linking is not available.
+    """
+    if not source.is_dir():
+        return
+    target.mkdir(parents=True, exist_ok=True)
+    for entry in source.iterdir():
+        if not entry.is_file():
+            continue
+        destination = target / entry.name
+        if destination.exists():
+            continue
+        try:
+            os.link(entry, destination)
+        except OSError:
+            shutil.copy2(entry, destination)
 
 
 def _safe_filename(name: str, *, fallback: str) -> str:

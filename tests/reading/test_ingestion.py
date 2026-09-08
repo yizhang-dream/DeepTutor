@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from deeptutor.reading import ingestion as ingestion_module
 from deeptutor.reading.catalog_models import IngestionStatus, SourceKind
 from deeptutor.reading.catalog_store import ReadingCatalogStore
 from deeptutor.reading.extract import (
@@ -25,6 +26,7 @@ from deeptutor.reading.ingestion import (
 )
 from deeptutor.reading.models import ReadingError
 from deeptutor.reading.store import ReadingStore
+from deeptutor.services.web_source.snapshot_assets import SnapshotAsset
 from deeptutor.tools.web_fetch import FetchOutcome, _extract_readable
 
 _ARTICLE_FIXTURE = Path(__file__).parents[1] / "fixtures" / "web" / "vector_article.html"
@@ -59,6 +61,61 @@ async def test_web_import_uses_safe_fetch_result_and_builds_sections(stores) -> 
     assert manifest.title == "A careful article"
     assert "First claim" in reading.unit_text(ready.material_id, 1)
     assert reading.outline(ready.material_id)[0].synthesised is True
+
+
+@pytest.mark.asyncio
+async def test_web_import_is_rich_localizes_images_and_preserves_old_revision(stores) -> None:
+    reading, catalog = stores
+    url = "https://example.com/article"
+
+    async def fetcher(_url: str, **_kwargs):
+        return FetchOutcome(
+            ok=True,
+            url="https://example.com/final/article",
+            title="Snapshot",
+            markdown=(
+                "<!-- source: https://example.com/legacy -->\n"
+                "# Snapshot\n\n![Diagram](https://cdn.example.com/diagram.png)"
+            ),
+        )
+
+    async def image_fetcher(_url: str):
+        return SnapshotAsset(b"\x89PNG\r\n\x1a\nimage", "image/png", "png")
+
+    service = ReadingIngestionService(
+        reading,
+        catalog,
+        web_fetcher=fetcher,
+        image_fetcher=image_fetcher,
+    )
+    queued = service.queue_url(url)
+    reading.ingest_units(
+        queued.material_id,
+        filename=f"{queued.material_id}.md",
+        units=["<!-- source: https://example.com/old -->\n# Old snapshot"],
+        source_type="url_snapshot",
+        source_url=url,
+    )
+
+    ready = await service.process_url(queued.material_id)
+    manifest = reading.manifest(ready.material_id)
+    current = reading.unit_text(ready.material_id, 1)
+
+    assert manifest.content_format == "web_markdown"
+    assert manifest.source_url == "https://example.com/final/article"
+    assert manifest.revision == 2
+    assert "<!-- source:" not in current
+    assert "/api/reading/materials/" in current
+    assert (
+        reading.asset_path(
+            ready.material_id,
+            next((reading._dir(ready.material_id) / "assets").iterdir()).name,
+        )
+        is not None
+    )
+    revisions = reading.revisions(ready.material_id)
+    assert [row.revision for row in revisions] == [1]
+    assert "# Old snapshot" in reading.revision_unit_text(ready.material_id, 1, 1)
 
 
 @pytest.mark.asyncio
@@ -356,10 +413,85 @@ async def test_local_video_keeps_playable_raw_and_transcribes_chunks(
 
 
 @pytest.mark.asyncio
+async def test_media_without_a_configured_provider_fails_before_running_ffmpeg(
+    stores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Name the missing setting, and do not spend ffmpeg proving it is missing."""
+    reading, catalog = stores
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"video bytes")
+    ran = {"chunker": False}
+
+    async def chunker(_path: Path):
+        ran["chunker"] = True
+        return []
+
+    monkeypatch.setattr(
+        ingestion_module,
+        "_probe_stt_configuration",
+        lambda: "No active STT model is configured. Set it in Settings > Voice.",
+    )
+    service = ReadingIngestionService(reading, catalog, media_chunker=chunker)
+    service._probes_stt = True
+
+    queued = await service.queue_media(source, filename="lecture.mp4")
+    failed = await service.process_media(queued.material_id)
+
+    assert failed.status is IngestionStatus.FAILED
+    assert failed.error_code == "stt_not_configured"
+    assert "Settings > Voice" in failed.error_detail
+    assert ran["chunker"] is False
+    # The upload survives the failure, so configuring a provider and retrying
+    # is all the user has to do.
+    assert reading.raw_path(queued.material_id).read_bytes() == b"video bytes"
+
+
+@pytest.mark.asyncio
+async def test_media_retry_reruns_transcription_from_the_stored_original(
+    stores, tmp_path: Path
+) -> None:
+    """A failed transcription must not cost the user the upload.
+
+    The original is stored before speech-to-text is attempted, so retrying is
+    a server-side re-run — not "please find that two-gigabyte lecture again".
+    """
+    reading, catalog = stores
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"stable video bytes")
+    attempts = {"n": 0}
+
+    async def chunker(_path: Path):
+        return [(0.0, 600.0, b"audio-one")]
+
+    async def transcriber(_audio: bytes, **_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("No endpoint URL configured for STT.")
+        return "the transcript, second time around"
+
+    service = ReadingIngestionService(
+        reading, catalog, media_chunker=chunker, transcriber=transcriber
+    )
+    queued = await service.queue_media(source, filename="lecture.mp4")
+    failed = await service.process_media(queued.material_id)
+
+    assert failed.status is IngestionStatus.FAILED
+    # Still playable while it is broken: the bytes never depended on the text.
+    assert reading.raw_path(queued.material_id).read_bytes() == b"stable video bytes"
+
+    recovered = await service.retry(queued.material_id)
+
+    assert recovered.status is IngestionStatus.READY
+    assert reading.unit_text(queued.material_id, 1) == "the transcript, second time around"
+    assert reading.raw_path(queued.material_id).read_bytes() == b"stable video bytes"
+
+
+@pytest.mark.asyncio
 async def test_media_ingestion_failure_is_logged_and_persisted(
     stores,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reading, catalog = stores
     source = tmp_path / "broken.mp4"
@@ -368,6 +500,7 @@ async def test_media_ingestion_failure_is_logged_and_persisted(
     async def failing_chunker(_path: Path):
         raise RuntimeError("decoder crashed")
 
+    monkeypatch.setattr(ingestion_module, "_probe_stt_configuration", lambda: "")
     service = ReadingIngestionService(*stores, media_chunker=failing_chunker)
     with caplog.at_level(logging.ERROR, logger="deeptutor.reading.ingestion"):
         with pytest.raises(RuntimeError, match="decoder crashed"):

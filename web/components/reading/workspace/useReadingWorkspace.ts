@@ -5,16 +5,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useReading } from "@/context/ReadingContext";
-import { useUnifiedChat } from "@/context/UnifiedChatContext";
-import { getMaterial, getUnitText } from "@/lib/reading-api";
+import { useChatStateAdapter } from "@/features/chat/ChatStateAdapter";
+import { courseSessionConfiguration } from "@/lib/course-session-scope";
+import {
+  addBookmark,
+  deleteBookmark,
+  getMaterial,
+  getReadingTranscript,
+  listBookmarks,
+  type ReadingBookmark,
+} from "@/lib/reading-api";
 import {
   READER_ACTION_EVENT,
   type ReaderActionPayload,
 } from "@/lib/reading-reader-action";
-import {
-  READING_CAPABILITY,
-  setReadingWorkspace,
-} from "@/lib/reading-turn-state";
+import { setReadingWorkspace } from "@/lib/reading-turn-state";
+import { READING_WORKSPACE_MODE } from "@/lib/workspace-mode";
 import {
   activateReadingMaterial,
   deleteReadingConversation,
@@ -40,9 +46,14 @@ import type { TranscriptRow } from "./types";
  * bootstrapping and the source lifecycle live here so the view stays readable
  * and each effect has one obvious owner.
  */
+/** Stable empty list, so a material with no bookmarks is not a new array
+ *  identity on every render. */
+const NO_BOOKMARKS: ReadingBookmark[] = [];
+
 export function useReadingWorkspace(
   workspaceId: string,
   sessionIdParam: string | null,
+  courseId = "",
 ) {
   const router = useRouter();
   const { t } = useTranslation();
@@ -50,12 +61,11 @@ export function useReadingWorkspace(
     useReading();
   const {
     state,
-    setCapability,
-    setTools,
+    configureSession,
     loadSession,
     newSession,
     cancelStreamingTurn,
-  } = useUnifiedChat();
+  } = useChatStateAdapter();
 
   const [workspace, setWorkspace] = useState<ReadingWorkspace | null>(null);
   const [conversations, setConversations] = useState<ReadingConversation[]>([]);
@@ -100,13 +110,16 @@ export function useReadingWorkspace(
 
   useEffect(() => {
     setReadingWorkspace(workspaceId);
-    setCapability(READING_CAPABILITY);
-    setTools(["web_search", "reason"]);
     return () => {
       setReadingWorkspace(null);
       closeMaterial();
     };
-  }, [closeMaterial, setCapability, setTools, workspaceId]);
+  }, [closeMaterial, workspaceId]);
+
+  const sessionConfiguration = useMemo(
+    () => ({ workspaceMode: READING_WORKSPACE_MODE }),
+    [],
+  );
 
   const activeTab = useMemo(
     () =>
@@ -169,14 +182,20 @@ export function useReadingWorkspace(
 
   useEffect(() => {
     if (!workspace || loading) return;
-    const bootKey = `${workspaceId}:${sessionIdParam ?? "new"}`;
+    const bootKey = `${workspaceId}:${sessionIdParam ?? "new"}:${courseId.trim()}`;
     if (sessionBootRef.current === bootKey) return;
     sessionBootRef.current = bootKey;
+
+    // The URL catching up with the session the first turn just created is not
+    // a request to open a different conversation — the transcript on screen
+    // already IS that conversation. Reloading it here would swap a streaming
+    // answer for whatever partial row the backend has written so far.
+    if (sessionIdParam && sessionIdParam === state.sessionId) return;
 
     void (async () => {
       try {
         // The URL is the truth about which conversation is open, the same
-        // rule /home follows: `/reading/<ws>/<id>` opens that conversation,
+        // rule /chat follows: `/reading/<ws>/sessions/<id>` opens that conversation,
         // `/reading/<ws>` is a *new* one. This used to reopen the most recent
         // conversation instead, so arriving from the library — which links to
         // the bare collection URL — dropped the reader into an old transcript
@@ -186,9 +205,16 @@ export function useReadingWorkspace(
         // the backend attaches the session to this workspace when the first
         // turn runs (see `turn_runtime`), so opening a collection and walking
         // away no longer litters it with empty conversations.
-        if (sessionIdParam) await loadSession(sessionIdParam);
-        else newSession();
-        setCapability(READING_CAPABILITY);
+        const scopedSessionConfiguration = courseSessionConfiguration(
+          sessionConfiguration,
+          courseId,
+        );
+        if (sessionIdParam) {
+          await loadSession(sessionIdParam);
+          configureSession(scopedSessionConfiguration, sessionIdParam);
+        } else {
+          newSession({ ...scopedSessionConfiguration, capability: null });
+        }
       } catch (caught) {
         setError(
           caught instanceof Error
@@ -198,11 +224,14 @@ export function useReadingWorkspace(
       }
     })();
   }, [
+    configureSession,
+    courseId,
     loadSession,
     loading,
     newSession,
     sessionIdParam,
-    setCapability,
+    sessionConfiguration,
+    state.sessionId,
     t,
     workspace,
     workspaceId,
@@ -211,40 +240,29 @@ export function useReadingWorkspace(
   useEffect(() => {
     if (!material || material.unit !== "segment") return;
     const requestId = ++transcriptRequestRef.current;
-    const limit = Math.min(material.unit_count, 160);
-    void Promise.allSettled(
-      Array.from({ length: limit }, (_, index) => index + 1).map(
-        async (locator) => {
-          const unit = await getUnitText(material.material_id, locator);
-          const ref = material.unit_refs.find((row) => row.locator === locator);
-          if (unit.text === "[Transcript unavailable for this video.]") {
-            return null;
-          }
-          return {
-            locator,
-            title: ref?.title || `${locator}`,
-            text: unit.text,
-            sourceHref: ref?.source_href || "",
-          };
-        },
-      ),
-      // allSettled, not all: one unreadable segment must not discard the other
-      // 159. `all` rejected the whole batch and, with no catch, left the
-      // transcript silently empty behind an unhandled rejection.
-    ).then((results) => {
-      if (transcriptRequestRef.current !== requestId) return;
-      const rows = results
-        .filter(
-          (result): result is PromiseFulfilledResult<TranscriptRow | null> =>
-            result.status === "fulfilled",
-        )
-        .map((result) => result.value)
-        .filter((row): row is TranscriptRow => row !== null);
-      setTranscript(rows);
-      if (!rows.length && results.some((r) => r.status === "rejected")) {
+    // One request for the whole transcript. Segments follow the speaker's
+    // sentences, so a lecture has hundreds of them and fetching each on its own
+    // meant hundreds of round trips before the panel could draw anything.
+    void getReadingTranscript(material.material_id)
+      .then((payload) => {
+        if (transcriptRequestRef.current !== requestId) return;
+        const rows: TranscriptRow[] = payload.segments
+          .filter(
+            (row) => row.text !== "[Transcript unavailable for this video.]",
+          )
+          .map((row) => ({
+            locator: row.locator,
+            title: row.title || `${row.locator}`,
+            text: row.text,
+            sourceHref: row.source_href,
+          }));
+        setTranscript(rows);
+      })
+      .catch(() => {
+        if (transcriptRequestRef.current !== requestId) return;
+        setTranscript([]);
         setNotice(t("This transcript could not be loaded."));
-      }
-    });
+      });
   }, [material, t]);
 
   const activeConversation = useMemo(
@@ -258,6 +276,88 @@ export function useReadingWorkspace(
   const linkedSessionIds = useMemo(
     () => activeConversation?.linked_session_ids ?? [],
     [activeConversation],
+  );
+
+  /* ── Bookmarks ────────────────────────────────────────────────────────
+     Kept here rather than inside the reader because two surfaces read them:
+     the reader's own toolbar (is *this* page kept?) and the outline panel
+     (the list, and jumping to one). Two copies would drift the moment either
+     one added a bookmark. */
+  const materialId = material?.material_id ?? "";
+  const [loadedBookmarks, setLoadedBookmarks] = useState<{
+    materialId: string;
+    rows: ReadingBookmark[];
+  }>({ materialId: "", rows: [] });
+  // Derived rather than stored: switching material has to drop the previous
+  // one's bookmarks in the same render it switches, and an effect that called
+  // setState to clear them would both show the wrong list for a frame and
+  // trip the compiler's set-state-in-effect rule.
+  const bookmarks =
+    loadedBookmarks.materialId === materialId
+      ? loadedBookmarks.rows
+      : NO_BOOKMARKS;
+
+  useEffect(() => {
+    if (!materialId) return;
+    let cancelled = false;
+    void listBookmarks(materialId)
+      .then((rows) => {
+        if (!cancelled) setLoadedBookmarks({ materialId, rows });
+      })
+      .catch(() => {
+        if (!cancelled) setLoadedBookmarks({ materialId, rows: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [materialId]);
+
+  // One control, both directions: the toolbar button reads "is this page
+  // kept?" off the same list it writes to, so pressing it again removes what
+  // the last press added.
+  const toggleBookmark = useCallback(
+    async (locator: number, label = "") => {
+      if (!materialId) return;
+      const existing = bookmarks.find((row) => row.locator === locator);
+      try {
+        if (existing) {
+          await deleteBookmark(materialId, existing.bookmark_id);
+        } else {
+          await addBookmark(materialId, locator, label);
+        }
+        setLoadedBookmarks({
+          materialId,
+          rows: await listBookmarks(materialId),
+        });
+      } catch (caught) {
+        setNotice(
+          caught instanceof Error
+            ? caught.message
+            : t("That bookmark could not be saved."),
+        );
+      }
+    },
+    [bookmarks, materialId, t],
+  );
+
+  const removeBookmark = useCallback(
+    async (bookmarkId: string) => {
+      if (!materialId) return;
+      try {
+        await deleteBookmark(materialId, bookmarkId);
+        setLoadedBookmarks({
+          materialId,
+          rows: await listBookmarks(materialId),
+        });
+      } catch (caught) {
+        setNotice(
+          caught instanceof Error
+            ? caught.message
+            : t("That bookmark could not be removed."),
+        );
+      }
+    },
+    [materialId, t],
   );
 
   const switchMaterial = useCallback(
@@ -312,31 +412,57 @@ export function useReadingWorkspace(
     [workspace],
   );
 
-  // The same gesture /home's "new chat" makes: stop whatever is streaming,
-  // reset to a local draft, and navigate to the URL that *means* "new". No
-  // row is written until the learner actually says something, and the title
-  // is then the one the model writes from that first turn rather than a
-  // placeholder every conversation shares.
+  // The same gesture /chat's "new chat" makes: reset to a local draft and
+  // navigate to the URL that *means* "new". No row is written until the
+  // learner actually says something, and the title is then the one the model
+  // writes from that first turn rather than a placeholder every conversation
+  // shares.
+  //
+  // Deliberately does not cancel the streaming turn. It used to, copying
+  // /chat — and copying its bug: the turn being cancelled belongs to the
+  // conversation being navigated *away* from, so starting a new one killed
+  // the previous answer mid-flight.
   const newConversation = useCallback(() => {
     if (!workspace) return;
-    cancelStreamingTurn();
-    newSession();
+    newSession({ ...sessionConfiguration, capability: null });
     router.push(`/reading/${workspace.workspace_id}`);
-  }, [cancelStreamingTurn, newSession, router, workspace]);
+  }, [
+    newSession,
+    router,
+    sessionConfiguration,
+    workspace,
+  ]);
 
   // When the first turn assigns a session id, put it in the URL and let the
-  // conversation menu see the row the backend just attached. Mirrors the
-  // binding effect on /home; without it a draft conversation would stay on
-  // the bare collection URL and a refresh would silently start over.
+  // conversation menu see the row the backend just attached. Without it a
+  // draft conversation would stay on the bare collection URL and a refresh
+  // would silently start over.
+  //
+  // The URL is written with the native history API rather than `router.replace`
+  // on purpose. `/reading/<ws>` and `/reading/<ws>/sessions/<id>` are different
+  // route matches, and App Router treats moving between them — even within one
+  // catch-all segment, which was tried — as a navigation: it unmounted the
+  // whole workspace and mounted it again mid-answer. Measured, that meant the
+  // reader's subtree left the DOM, "Opening collection…" painted for a frame,
+  // the material was re-fetched and the page the learner was on reset to 1.
+  // Asking the first question of a conversation blinked the entire screen.
+  //
+  // Nothing about that navigation was real: the learner stayed exactly where
+  // they were and the conversation they are watching stream is the one being
+  // named. So the address bar is corrected in place and `usePathname` — which
+  // does follow the native API — keeps `sessionIdParam` honest for refreshes,
+  // links and the back button.
   useEffect(() => {
     if (!state.sessionId || sessionIdParam) return;
-    router.replace(`/reading/${workspaceId}/${state.sessionId}`, {
-      scroll: false,
-    });
+    window.history.replaceState(
+      null,
+      "",
+      `/reading/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(state.sessionId)}`,
+    );
     void listReadingConversations(workspaceId)
       .then(setConversations)
       .catch(() => {});
-  }, [router, sessionIdParam, state.sessionId, workspaceId]);
+  }, [sessionIdParam, state.sessionId, workspaceId]);
 
   const renameConversation = useCallback(
     async (sessionId: string, title: string) => {
@@ -346,7 +472,7 @@ export function useReadingWorkspace(
     [workspaceId],
   );
 
-  // Mirrors /home's delete: drop the row, and if it was the conversation on
+  // Mirrors /chat's delete: drop the row, and if it was the conversation on
   // screen, fall back to a fresh draft rather than leaving the reader looking
   // at a transcript that no longer exists.
   const deleteConversation = useCallback(
@@ -355,20 +481,27 @@ export function useReadingWorkspace(
       setConversations(await listReadingConversations(workspaceId));
       if (sessionId === sessionIdParam) {
         cancelStreamingTurn();
-        newSession();
+        newSession({ ...sessionConfiguration, capability: null });
         router.push(`/reading/${workspaceId}`);
       }
     },
-    [cancelStreamingTurn, newSession, router, sessionIdParam, workspaceId],
+    [
+      cancelStreamingTurn,
+      newSession,
+      router,
+      sessionConfiguration,
+      sessionIdParam,
+      workspaceId,
+    ],
   );
 
   const openConversation = useCallback(
     async (sessionId: string) => {
-      router.push(`/reading/${workspaceId}/${sessionId}`);
+      router.push(`/reading/${workspaceId}/sessions/${sessionId}`);
       await loadSession(sessionId);
-      setCapability(READING_CAPABILITY);
+      configureSession(sessionConfiguration, sessionId);
     },
-    [loadSession, router, setCapability, workspaceId],
+    [configureSession, loadSession, router, sessionConfiguration, workspaceId],
   );
 
   const organizeNotes = useCallback(async () => {
@@ -438,6 +571,9 @@ export function useReadingWorkspace(
     linkedSessionIds,
     activeLocator,
     setActiveLocator,
+    bookmarks,
+    toggleBookmark,
+    removeBookmark,
     transcript,
     organizedNotes,
     setOrganizedNotes,

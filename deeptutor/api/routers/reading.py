@@ -30,6 +30,11 @@ from fastapi.params import File
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
+from deeptutor.multi_user.learning_access import (
+    assert_learning_material,
+    assert_learning_material_mutation,
+    current_learning_policy,
+)
 from deeptutor.reading import (
     ANNOTATION_COLORS,
     Annotation,
@@ -44,12 +49,17 @@ from deeptutor.reading import (
     export_material,
     render_outline,
 )
-from deeptutor.reading.ingestion import ReadingIngestionService, url_material_id
+from deeptutor.reading.ingestion import (
+    MAX_TRANSCRIPT_BYTES,
+    ReadingIngestionService,
+    url_material_id,
+)
 from deeptutor.reading.knowledge_capture import (
     organize_workspace_notes,
     send_workspace_to_notebook,
 )
 from deeptutor.reading.models import MAX_TEXT_SELECTOR_CHARS
+from deeptutor.services.session.workspace_preferences import WORKSPACE_MODE_READING
 from deeptutor.utils.document_validator import DocumentValidator
 
 logger = logging.getLogger(__name__)
@@ -114,6 +124,8 @@ def _http_error(exc: Exception) -> HTTPException:
     locator, unsupported format, no extractable text). A 500 is reserved for
     failures that are genuinely ours.
     """
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, MaterialNotFound):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, ReadingUpgradeConflict):
@@ -122,6 +134,45 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(exc))
     logger.warning("unexpected reading error", exc_info=True)
     return HTTPException(status_code=500, detail="The reader could not complete that request.")
+
+
+def _assigned_material_ids() -> set[str] | None:
+    """Return the account allowlist, or ``None`` for unrestricted accounts."""
+    policy = current_learning_policy()
+    if policy is None:
+        return None
+    reading = policy.get("reading")
+    if not isinstance(reading, dict):
+        return {"*"}
+    assigned = set(reading.get("material_ids") or [])
+    return None if "*" in assigned else assigned
+
+
+def _material_allowed(material_id: str) -> bool:
+    assigned = _assigned_material_ids()
+    return assigned is None or material_id in assigned
+
+
+def _enforce_learning_materials(*material_ids: str) -> None:
+    for material_id in material_ids:
+        if material_id:
+            assert_learning_material(material_id)
+
+
+def _workspace_payload(row: Any) -> dict[str, Any]:
+    """Hide tabs that are no longer assigned to a learning account."""
+    payload = row.to_dict()
+    assigned = _assigned_material_ids()
+    if assigned is None:
+        return payload
+    payload["tabs"] = [
+        tab
+        for tab in payload.get("tabs", [])
+        if tab.get("material", {}).get("material_id") in assigned
+    ]
+    if payload.get("active_material_id") not in assigned:
+        payload["active_material_id"] = None
+    return payload
 
 
 # === Models ===================================================================
@@ -140,6 +191,10 @@ class MaterialInfo(BaseModel):
     has_raw_view: bool = False
     render_mode: Literal["text", "pdf", "epub", "video", "audio"] = "text"
     extractor: str = ""
+    content_format: Literal["plain_text", "web_markdown"] = "plain_text"
+    source_type: str = "upload"
+    source_url: str = ""
+    revision: int = 1
     annotation_count: int = 0
 
 
@@ -187,7 +242,7 @@ class AnnotationPayload(BaseModel):
 
     annotation_id: str = ""
     locator: int = Field(ge=1)
-    kind: Literal["highlight", "underline", "note"] = "highlight"
+    kind: Literal["highlight", "underline", "note", "citation"] = "highlight"
     color: str = "yellow"
     quote: str = Field(default="", max_length=2000)
     note: str = ""
@@ -218,6 +273,7 @@ class AnnotationPayload(BaseModel):
 class AnnotationInfo(BaseModel):
     annotation_id: str
     locator: int
+    material_revision: int = 1
     kind: str
     color: str
     quote: str
@@ -238,6 +294,21 @@ class PositionPayload(BaseModel):
 
 class PositionInfo(PositionPayload):
     updated_at: float = 0.0
+
+
+class BookmarkPayload(BaseModel):
+    locator: int = Field(ge=1)
+    label: str = Field(default="", max_length=200)
+    source_anchor: str = Field(default="", max_length=4096)
+
+
+class BookmarkInfo(BookmarkPayload):
+    bookmark_id: str
+    created_at: float = 0.0
+
+
+class BookmarkList(BaseModel):
+    bookmarks: list[BookmarkInfo]
 
 
 class SupportedFormats(BaseModel):
@@ -336,7 +407,13 @@ async def list_library_materials(
         for manifest in store.list_materials():
             if catalog.get_material(manifest.material_id) is None:
                 catalog.register_manifest(manifest)
-        rows = catalog.list_materials(search=search, status=status, library_filter=library_filter)
+        rows = [
+            row
+            for row in catalog.list_materials(
+                search=search, status=status, library_filter=library_filter
+            )
+            if _material_allowed(row.material_id)
+        ]
         membership = catalog.collections_for_materials([row.material_id for row in rows])
         materials: list[dict[str, Any]] = []
         for row in rows:
@@ -346,9 +423,13 @@ async def list_library_materials(
             payload["size_bytes"] = size_bytes
             payload["unit_count"] = unit_count
             materials.append(payload)
-        # Counts describe the whole library, not the filtered page, so the
-        # filter chips can show what they would reveal before being clicked.
-        return {"materials": materials, "counts": catalog.library_counts()}
+        # Counts describe every material this account may see, not only the
+        # filtered page and never revoked or unassigned learner material.
+        assigned = _assigned_material_ids()
+        return {
+            "materials": materials,
+            "counts": catalog.library_counts(None if assigned is None else sorted(assigned)),
+        }
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -380,7 +461,7 @@ async def duplicate_check(payload: DuplicateCheckRequest) -> dict[str, Any]:
             if record is None and item.filename:
                 record = catalog.find_ready_material_by_filename(item.filename, mime=item.mime)
                 kind = "same_name"
-            if record is None:
+            if record is None or not _material_allowed(record.material_id):
                 continue
             matches.append(
                 {
@@ -396,7 +477,7 @@ async def duplicate_check(payload: DuplicateCheckRequest) -> dict[str, Any]:
             except Exception:  # noqa: BLE001 - a malformed URL is simply not a match
                 continue
             record = catalog.get_material(material_id)
-            if record is None:
+            if record is None or not _material_allowed(record.material_id):
                 continue
             matches.append(
                 {
@@ -416,6 +497,10 @@ async def import_urls(
     payload: UrlImportRequest, background_tasks: BackgroundTasks
 ) -> dict[str, Any]:
     """Queue safe webpage, YouTube, or Bilibili imports into a workspace."""
+    try:
+        assert_learning_material("", upload=True)
+    except PermissionError as exc:
+        raise _http_error(exc) from exc
     service = _ingestion()
     try:
         materials = [service.queue_url(url) for url in payload.urls]
@@ -446,6 +531,7 @@ async def import_urls(
 async def retry_import(material_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
     service = _ingestion()
     try:
+        assert_learning_material(material_id)
         material = service.catalog.get_material(material_id)
         if material is None:
             raise MaterialNotFound(f"material {material_id!r} not found")
@@ -462,7 +548,7 @@ async def list_workspaces(
 ) -> dict[str, Any]:
     try:
         rows = _catalog().list_workspaces(search=search)
-        return {"workspaces": [row.to_dict() for row in rows]}
+        return {"workspaces": [_workspace_payload(row) for row in rows]}
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -493,6 +579,7 @@ async def list_workspace_index() -> dict[str, Any]:
 @router.post("/workspaces", status_code=201)
 async def create_workspace(payload: WorkspaceCreateRequest) -> dict[str, Any]:
     try:
+        _enforce_learning_materials(*payload.material_ids)
         row = _catalog().create_workspace(
             payload.title,
             payload.material_ids,
@@ -511,7 +598,7 @@ async def get_workspace(workspace_id: str) -> dict[str, Any]:
         if row is None:
             raise MaterialNotFound(f"reading workspace {workspace_id!r} not found")
         return {
-            "workspace": row.to_dict(),
+            "workspace": _workspace_payload(row),
             "sessions": [session.to_dict() for session in catalog.list_sessions(workspace_id)],
         }
     except Exception as exc:
@@ -581,6 +668,7 @@ async def add_workspace_material(
     workspace_id: str, payload: WorkspaceMaterialRequest
 ) -> dict[str, Any]:
     try:
+        assert_learning_material(payload.material_id)
         row = _catalog().add_material(
             workspace_id, payload.material_id, make_active=payload.make_active
         )
@@ -594,6 +682,7 @@ async def reorder_workspace_materials(
     workspace_id: str, payload: WorkspaceReorderRequest
 ) -> dict[str, Any]:
     try:
+        _enforce_learning_materials(*payload.material_ids)
         row = _catalog().reorder_materials(workspace_id, payload.material_ids)
         return {"workspace": row.to_dict()}
     except Exception as exc:
@@ -603,6 +692,7 @@ async def reorder_workspace_materials(
 @router.put("/workspaces/{workspace_id}/materials/{material_id}/active")
 async def activate_workspace_material(workspace_id: str, material_id: str) -> dict[str, Any]:
     try:
+        assert_learning_material(material_id)
         row = _catalog().set_active_material(workspace_id, material_id)
         return {"workspace": row.to_dict()}
     except Exception as exc:
@@ -612,6 +702,7 @@ async def activate_workspace_material(workspace_id: str, material_id: str) -> di
 @router.delete("/workspaces/{workspace_id}/materials/{material_id}")
 async def remove_workspace_material(workspace_id: str, material_id: str) -> dict[str, Any]:
     try:
+        assert_learning_material(material_id)
         row = _catalog().remove_material(workspace_id, material_id)
         return {"workspace": row.to_dict()}
     except Exception as exc:
@@ -665,6 +756,8 @@ async def create_reading_session(
 
     catalog = _catalog()
     try:
+        if payload.active_material_id:
+            assert_learning_material(payload.active_material_id)
         workspace = catalog.get_workspace(workspace_id)
         if workspace is None:
             raise MaterialNotFound(f"reading workspace {workspace_id!r} not found")
@@ -679,6 +772,7 @@ async def create_reading_session(
             session["id"],
             {
                 "capability": "immersive_reading",
+                "workspace_mode": WORKSPACE_MODE_READING,
                 "session_kind": "immersive_reading",
                 "reading_workspace_id": workspace_id,
                 "reading_material_id": active_material_id or "",
@@ -759,6 +853,7 @@ async def organize_reading_notes(
     workspace_id: str, payload: OrganizeNotesRequest
 ) -> dict[str, Any]:
     try:
+        _enforce_learning_materials(*payload.material_ids)
         catalog = _catalog()
         notes = await asyncio.to_thread(
             organize_workspace_notes,
@@ -777,6 +872,7 @@ async def capture_reading_to_notebook(
     workspace_id: str, payload: NotebookCaptureRequest
 ) -> dict[str, Any]:
     try:
+        _enforce_learning_materials(*payload.material_ids)
         catalog = _catalog()
         result = await asyncio.to_thread(
             send_workspace_to_notebook,
@@ -810,7 +906,11 @@ async def supported_formats() -> SupportedFormats:
 async def list_materials() -> list[MaterialInfo]:
     store = _store()
     try:
-        return [_info(store, manifest) for manifest in store.list_materials()]
+        return [
+            _info(store, manifest)
+            for manifest in store.list_materials()
+            if _material_allowed(manifest.material_id)
+        ]
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -827,11 +927,22 @@ async def upload_material(
     The upload is streamed to a temp file with a running size check, so an
     oversized file is rejected before it is fully buffered rather than after.
 
-    Parsing happens inline, so scanned PDFs (which fall back to a minutes-long
-    OCR run) can outlive HTTP-level client timeouts. Pass ``async=true`` to
-    get a ``202 {"status": "processing"}`` immediately and let the ingest run
-    as a background task; poll ``GET /materials`` until the file shows up.
+    Audio and video answer as soon as the file is stored and transcription is
+    queued, the same shape as a URL import. Holding the request open for the
+    length of a lecture meant no progress could reach the client, the browser
+    or a proxy could time the upload out after the transcription had already
+    been paid for, and nothing was left on disk to retry from.
+
+    Regular documents parse inline, so scanned PDFs (which fall back to a
+    minutes-long OCR run) can outlive HTTP-level client timeouts. Pass
+    ``async=true`` to get a ``202 {"status": "processing"}`` immediately and
+    let the ingest run as a background task; poll ``GET /materials`` until the
+    file shows up.
     """
+    try:
+        assert_learning_material("", upload=True)
+    except PermissionError as exc:
+        raise _http_error(exc) from exc
     filename = (file.filename or "").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="The upload has no filename.")
@@ -857,10 +968,10 @@ async def upload_material(
 
         store = _store()
         if Path(filename).suffix.lower() in _MEDIA_EXTENSIONS:
-            record = await ReadingIngestionService(store, _catalog()).import_media(
-                tmp_path, filename=filename
-            )
-            manifest = store.manifest(record.material_id)
+            service = ReadingIngestionService(store, _catalog())
+            record = await service.queue_media(tmp_path, filename=filename)
+            background_tasks.add_task(service.process_media, record.material_id)
+            return _detail(store, store.manifest(record.material_id))
         elif async_mode:
             # Move the validated upload somewhere that outlives this request
             # (the finally below removes tmp_dir) and ingest off-request.
@@ -916,6 +1027,7 @@ async def upload_material(
 async def get_material(material_id: str) -> MaterialDetail:
     store = _store()
     try:
+        assert_learning_material(material_id)
         return _detail(store, store.manifest(material_id))
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -926,6 +1038,7 @@ async def epub_pairing_candidates(material_id: str) -> list[dict[str, Any]]:
     from deeptutor.reading.epub_bilingual import recommend_epub_candidates
 
     try:
+        assert_learning_material(material_id)
         return await asyncio.to_thread(recommend_epub_candidates, _store(), material_id)
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -943,6 +1056,7 @@ async def create_epub_pairing(payload: EpubPairingRequest) -> dict[str, Any]:
     from deeptutor.reading.epub_bilingual import create_epub_pairing
 
     try:
+        _enforce_learning_materials(payload.english_material_id, payload.chinese_material_id)
         pairing = await asyncio.to_thread(
             create_epub_pairing,
             _store(),
@@ -974,6 +1088,7 @@ async def delete_material(material_id: str) -> dict[str, Any]:
     record = catalog.get_material(material_id)
     removed_from = catalog.collections_for_material(material_id) if record else []
     try:
+        assert_learning_material_mutation(material_id)
         shared = record is not None and catalog.count_materials_for_content(record.content_id) > 1
         if shared and record is not None:
             # A sibling material still reads this content: drop this row and
@@ -997,11 +1112,53 @@ async def delete_material(material_id: str) -> dict[str, Any]:
     }
 
 
+@router.get("/materials/{material_id}/transcript")
+async def get_transcript(material_id: str) -> dict[str, Any]:
+    """Every transcript segment of a timed material, in one response.
+
+    The reader's transcript panel needs all of them at once. Fetching them one
+    locator at a time meant a request per segment — fine when a segment was ten
+    minutes long, wasteful now that they follow the speaker's own sentences.
+    """
+    store = _store()
+    try:
+        assert_learning_material(material_id)
+        manifest = store.manifest(material_id)
+        if manifest.render_mode not in {"video", "audio"}:
+            raise ReadingError("this material has no timed transcript")
+        refs = {row.locator: row for row in store.unit_references(material_id)}
+        segments: list[dict[str, Any]] = []
+        budget = MAX_TRANSCRIPT_BYTES
+        for locator, text in store.iter_units(material_id):
+            budget -= len(text.encode("utf-8"))
+            if budget < 0:
+                break
+            ref = refs.get(locator)
+            segments.append(
+                {
+                    "locator": locator,
+                    "text": text,
+                    "title": ref.title if ref else "",
+                    "source_href": ref.source_href if ref else "",
+                }
+            )
+        return {
+            "material_id": material_id,
+            "revision": manifest.revision,
+            "unit_count": manifest.unit_count,
+            "truncated": len(segments) < manifest.unit_count,
+            "segments": segments,
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/materials/{material_id}/units/{locator}", response_model=UnitText)
 async def get_unit(material_id: str, locator: int) -> UnitText:
     """One unit's text — the reader's text view, and the only view for non-PDFs."""
     store = _store()
     try:
+        assert_learning_material(material_id)
         manifest = store.manifest(material_id)
         return UnitText(
             locator=locator,
@@ -1012,11 +1169,44 @@ async def get_unit(material_id: str, locator: int) -> UnitText:
         raise _http_error(exc) from exc
 
 
+@router.get("/materials/{material_id}/revisions")
+async def list_material_revisions(material_id: str) -> list[dict[str, Any]]:
+    """Prior immutable snapshots retained when a URL is cleaned/refetched."""
+    store = _store()
+    try:
+        return [row.to_dict() for row in store.revisions(material_id)]
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get(
+    "/materials/{material_id}/revisions/{revision}/units/{locator}",
+    response_model=UnitText,
+)
+async def get_revision_unit(material_id: str, revision: int, locator: int) -> UnitText:
+    store = _store()
+    try:
+        manifest = next(
+            (row for row in store.revisions(material_id) if row.revision == revision),
+            None,
+        )
+        if manifest is None:
+            raise MaterialNotFound(f"revision {revision} not found")
+        return UnitText(
+            locator=locator,
+            unit=manifest.unit,
+            text=store.revision_unit_text(material_id, revision, locator),
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/materials/{material_id}/raw")
 async def get_raw(material_id: str) -> FileResponse:
     """The original bytes, for the faithful viewer. Serves Range requests."""
     store = _store()
     try:
+        assert_learning_material(material_id)
         manifest = store.manifest(material_id)
         path = store.raw_path(material_id)
     except Exception as exc:
@@ -1063,6 +1253,39 @@ async def get_material_media(material_id: str, name: str) -> FileResponse:
         media_type=mime or "image/png",
         filename=name,
         content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/materials/{material_id}/assets/{asset_name}")
+async def get_snapshot_asset(material_id: str, asset_name: str) -> FileResponse:
+    """Serve one authenticated, MIME-sniffed image captured with a web page."""
+    from deeptutor.services.web_source.snapshot_assets import snapshot_asset_mime
+
+    store = _store()
+    try:
+        assert_learning_material(material_id)
+        path = store.asset_path(material_id, asset_name)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    if path is None:
+        raise HTTPException(status_code=404, detail="Snapshot image not found.")
+    data = path.read_bytes()
+    mime = snapshot_asset_mime(data)
+    if mime is None:
+        raise HTTPException(status_code=404, detail="Snapshot image is invalid.")
+    return FileResponse(
+        path,
+        media_type=mime,
+        filename=path.name,
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -1070,6 +1293,7 @@ async def get_material_media(material_id: str, name: str) -> FileResponse:
 async def list_annotations(material_id: str) -> list[AnnotationInfo]:
     store = _store()
     try:
+        assert_learning_material(material_id)
         return [_annotation_info(row) for row in store.annotations(material_id)]
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -1080,6 +1304,7 @@ async def get_position(material_id: str) -> PositionInfo:
     """Return the user's last durable viewport for this material."""
     store = _store()
     try:
+        assert_learning_material(material_id)
         return PositionInfo(**store.position(material_id).to_dict())
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -1090,6 +1315,7 @@ async def save_position(material_id: str, payload: PositionPayload) -> PositionI
     """Persist a validated numeric locator plus an optional renderer anchor."""
     store = _store()
     try:
+        assert_learning_material(material_id)
         saved = store.save_position(
             material_id,
             ReadingPosition(
@@ -1103,11 +1329,54 @@ async def save_position(material_id: str, payload: PositionPayload) -> PositionI
         raise _http_error(exc) from exc
 
 
+@router.get("/materials/{material_id}/bookmarks", response_model=BookmarkList)
+async def list_bookmarks(material_id: str) -> BookmarkList:
+    """Every place the reader has kept in this material, in reading order."""
+    store = _store()
+    try:
+        assert_learning_material(material_id)
+        rows = store.bookmarks(material_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    return BookmarkList(bookmarks=[BookmarkInfo(**row.to_dict()) for row in rows])
+
+
+@router.post("/materials/{material_id}/bookmarks", response_model=BookmarkInfo)
+async def add_bookmark(material_id: str, payload: BookmarkPayload) -> BookmarkInfo:
+    """Keep one place. Bookmarking an already-kept locator returns that one."""
+    store = _store()
+    try:
+        assert_learning_material(material_id)
+        saved = store.add_bookmark(
+            material_id,
+            payload.locator,
+            payload.label,
+            payload.source_anchor,
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    return BookmarkInfo(**saved.to_dict())
+
+
+@router.delete("/materials/{material_id}/bookmarks/{bookmark_id}")
+async def delete_bookmark(material_id: str, bookmark_id: str) -> dict[str, bool]:
+    store = _store()
+    try:
+        assert_learning_material(material_id)
+        removed = store.delete_bookmark(material_id, bookmark_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    return {"ok": True}
+
+
 @router.put("/materials/{material_id}/annotations", response_model=AnnotationInfo)
 async def save_annotation(material_id: str, payload: AnnotationPayload) -> AnnotationInfo:
     """Create or update one annotation (id absent = create)."""
     store = _store()
     try:
+        assert_learning_material(material_id)
         saved = store.save_annotation(material_id, payload.to_annotation())
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -1118,6 +1387,7 @@ async def save_annotation(material_id: str, payload: AnnotationPayload) -> Annot
 async def delete_annotation(material_id: str, annotation_id: str) -> dict[str, Any]:
     store = _store()
     try:
+        assert_learning_material(material_id)
         removed = store.delete_annotation(material_id, annotation_id)
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -1139,6 +1409,7 @@ async def export(
     """
     store = _store()
     try:
+        assert_learning_material(material_id)
         result = export_material(store, material_id, fmt=fmt)
     except Exception as exc:
         raise _http_error(exc) from exc

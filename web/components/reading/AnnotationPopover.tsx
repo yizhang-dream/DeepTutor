@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
+  BookmarkPlus,
   Highlighter,
   MessageSquareQuote,
   StickyNote,
@@ -21,6 +22,7 @@ export interface AnnotationPopoverProps {
   onHighlight: (color: AnnotationColor) => void;
   onUnderline: (color: AnnotationColor) => void;
   onNote: (note: string, color: AnnotationColor) => void;
+  onCitation: (color: AnnotationColor) => void;
   onAsk: () => void;
   onDismiss: () => void;
 }
@@ -43,6 +45,7 @@ export function AnnotationPopover({
   onHighlight,
   onUnderline,
   onNote,
+  onCitation,
   onAsk,
   onDismiss,
 }: AnnotationPopoverProps) {
@@ -136,6 +139,11 @@ export function AnnotationPopover({
           onClick={() => setNoteOpen((open) => !open)}
         />
         <IconButton
+          icon={BookmarkPlus}
+          label={t("Save citation")}
+          onClick={() => onCitation(color)}
+        />
+        <IconButton
           icon={MessageSquareQuote}
           label={t("Ask about this")}
           onClick={onAsk}
@@ -159,7 +167,7 @@ export function AnnotationPopover({
             }}
             rows={3}
             placeholder={t("Your note…")}
-            className="w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] leading-relaxed text-[var(--foreground)] outline-none transition focus:border-[var(--ring)] focus:ring-2 focus:ring-[var(--ring)]/20"
+            className="w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] leading-relaxed text-[var(--foreground)] outline-none transition focus:border-[var(--ring)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--ring)_20%,transparent)]"
           />
           <div className="mt-1 flex items-center justify-end gap-1.5">
             <button

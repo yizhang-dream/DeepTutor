@@ -97,6 +97,12 @@ const nextConfig = {
   // process while it is running.
   distDir: process.env.DEEPTUTOR_NEXT_DIST_DIR || ".next",
 
+  // Build/typecheck wrappers can point Next at a process-local config so a
+  // production build never rewrites the tsconfig watched by a live dev server.
+  typescript: {
+    tsconfigPath: process.env.DEEPTUTOR_NEXT_TSCONFIG || "tsconfig.json",
+  },
+
   // Expose the build-time version to the browser so the sidebar badge
   // can compare it against GitHub's latest release.
   env: {
@@ -109,6 +115,12 @@ const nextConfig = {
   // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
 
+  // Keep the standalone bundle rooted at this frontend directory. Without an
+  // explicit root, Next.js can mirror the absolute checkout path inside
+  // `.next-deeptutor/standalone`, while the DeepTutor launcher expects
+  // `.next-deeptutor/standalone/server.js` directly.
+  outputFileTracingRoot: __dirname,
+
   // web/proxy.ts clones request bodies before rewriting them. Keep enough room
   // for individual large-body endpoints that still use Proxy. Knowledge-base
   // create/upload batches use dedicated streaming route handlers instead, so
@@ -120,24 +132,6 @@ const nextConfig = {
     proxyTimeout: 30 * 60 * 1000,
   },
 
-  // Mastery Path moved out of the Space hub to its own top-level route.
-  // Bookmarks, links pasted into a chat, and the browser history of anyone
-  // who used the feature before the move all still point at the old path.
-  async redirects() {
-    return [
-      {
-        source: "/space/learning",
-        destination: "/mastery",
-        permanent: false,
-      },
-      {
-        source: "/space/learning/:path*",
-        destination: "/mastery/:path*",
-        permanent: false,
-      },
-    ];
-  },
-
   // Move dev indicator to bottom-right corner
   devIndicators: {
     position: "bottom-right",
@@ -145,6 +139,24 @@ const nextConfig = {
 
   // Transpile mermaid and related packages for proper ESM handling
   transpilePackages: ["mermaid"],
+
+  // v1.6.2 and earlier bookmarked Mastery Study at `/study`; tip teaches under
+  // `/sessions`. Permanent redirects keep old URLs (and issue repro links)
+  // landing on the live surface instead of a bare 404.
+  async redirects() {
+    return [
+      {
+        source: "/mastery/:pathId/study",
+        destination: "/mastery/:pathId/sessions",
+        permanent: true,
+      },
+      {
+        source: "/mastery/:pathId/study/:sessionId",
+        destination: "/mastery/:pathId/sessions/:sessionId",
+        permanent: true,
+      },
+    ];
+  },
 
   // Next.js 16 blocks cross-origin access to /_next/* dev resources (HMR
   // WebSocket, fonts, dev-only scripts) unless the request host is on this

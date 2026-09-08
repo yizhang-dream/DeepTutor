@@ -1,4 +1,5 @@
-import type { StreamEvent } from "@/lib/unified-ws";
+import type { StreamEvent } from "@/features/chat/model/protocol";
+import { toolResultPayload } from "@/lib/tool-event";
 
 /**
  * Reading the `course_study` capability's hand-off signals off a turn's stream.
@@ -74,7 +75,7 @@ const TARGETS_WITH_COMPOSER: ReadonlySet<CourseHandoffTarget> = new Set([
 /**
  * Targets whose composer only exists once a specific resource is named.
  *
- * `/mastery/<id>/study` and `/reading/<id>` have somewhere to type; the
+ * `/mastery/<id>/sessions` and `/reading/<id>` have somewhere to type; the
  * `/mastery` and `/reading` indexes they fall back to when the course has no
  * such resource yet do not. Storing a prompt for those is worse than useless:
  * `setPendingPrompt` is scoped per destination and consumed on arrival, so an
@@ -119,13 +120,7 @@ export function courseHandoffFrom(event: {
   const metadata = event.metadata;
   if (!metadata || typeof metadata !== "object") return null;
 
-  const outer = metadata as Record<string, unknown>;
-  const nested = outer.tool_metadata;
-  const source = (
-    nested && typeof nested === "object" ? nested : outer
-  ) as Record<string, unknown>;
-
-  const raw = source.course_handoff;
+  const raw = toolResultPayload(metadata, "course_handoff");
   if (!raw || typeof raw !== "object") return null;
   const payload = raw as Record<string, unknown>;
   if (!isTarget(payload.target)) return null;
@@ -176,23 +171,24 @@ export function courseHandoffHref(payload: CourseHandoffPayload): string {
   const ref = encodeURIComponent(payload.ref_id);
   switch (payload.target) {
     case "immersive_reading":
-      // With nothing to open yet, the index is the honest destination — but it
-      // arrives course-scoped, so whatever the learner makes there attaches
-      // back here instead of stranding them one manual step from the course.
-      return payload.ref_id ? `/reading/${ref}` : `/reading?course=${course}`;
+      // Every branch stays course-scoped: an existing workspace still opens a
+      // conversation that belongs to this course, rather than only the empty
+      // index honouring the context that sent the learner here.
+      return payload.ref_id
+        ? `/reading/${ref}?course=${course}`
+        : `/reading?course=${course}`;
     case "mastery_path":
       // The study route, not the path overview: the overview has no composer,
       // so a prepared opening line would have nowhere to land.
       return payload.ref_id
-        ? `/mastery/${ref}/study`
+        ? `/mastery/${ref}/sessions?course=${course}`
         : `/mastery?course=${course}`;
     case "question_bank":
       return `/space/questions?course=${course}`;
     case "notebook":
-      // The console's own route: `/space/notebooks` only redirects here.
-      return `/notebook?course=${course}`;
+      return `/notebooks?course=${course}`;
     case "chat":
-      return `/home?course=${course}`;
+      return `/chat?course=${course}`;
   }
 }
 

@@ -9,9 +9,10 @@ import { apiFetch, apiUrl } from "@/lib/api";
 // "chapter 3" without ever branching on the file type itself.
 
 export type UnitKind = "page" | "chapter" | "slide" | "section" | "segment";
-export type AnnotationKind = "highlight" | "underline" | "note";
+export type AnnotationKind = "highlight" | "underline" | "note" | "citation";
 export type ExportFormat = "auto" | "pdf" | "markdown";
 export type RenderMode = "text" | "pdf" | "epub" | "video" | "audio";
+export type ContentFormat = "plain_text" | "web_markdown";
 
 /** Palette offered by the annotation toolbar; mirrored server-side. */
 export const ANNOTATION_COLORS = [
@@ -52,6 +53,10 @@ export interface MaterialInfo {
   has_raw_view: boolean;
   render_mode: RenderMode;
   extractor: string;
+  content_format?: ContentFormat;
+  source_type?: string;
+  source_url?: string;
+  revision?: number;
   annotation_count: number;
 }
 
@@ -100,6 +105,7 @@ export type ReadingTextSelector =
 export interface AnnotationItem {
   annotation_id: string;
   locator: number;
+  material_revision?: number;
   kind: AnnotationKind;
   color: string;
   quote: string;
@@ -132,6 +138,39 @@ export interface ReadingPosition {
   updated_at: number;
 }
 
+export function parseReadingPosition(payload: unknown): ReadingPosition {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Invalid reading position response");
+  }
+  const position = payload as Record<string, unknown>;
+  if (
+    typeof position.locator !== "number" ||
+    !Number.isFinite(position.locator) ||
+    position.locator < 1 ||
+    typeof position.source_anchor !== "string" ||
+    typeof position.percentage !== "number" ||
+    !Number.isFinite(position.percentage) ||
+    typeof position.updated_at !== "number" ||
+    !Number.isFinite(position.updated_at)
+  ) {
+    throw new Error("Invalid reading position response");
+  }
+  return position as unknown as ReadingPosition;
+}
+
+/**
+ * A place the reader chose to keep, as opposed to the position above — which
+ * is the single automatic "where I got to", overwritten on every move. These
+ * are deliberate and plural, and each has its own id.
+ */
+export interface ReadingBookmark {
+  bookmark_id: string;
+  locator: number;
+  label: string;
+  source_anchor: string;
+  created_at: number;
+}
+
 export interface SupportedFormats {
   extensions: string[];
   max_bytes: number;
@@ -161,7 +200,7 @@ export interface ReadingExtensionResult {
   payload: Record<string, unknown>;
 }
 
-const BASE = "/api/v1/reading";
+const BASE = "/api/reading";
 
 /** Surface the server's own message — it explains what the user can do next. */
 async function unwrap<T>(response: Response): Promise<T> {
@@ -269,6 +308,33 @@ export function materialMediaUrl(materialId: string, name: string): string {
   return apiUrl(
     `${BASE}/materials/${encodeURIComponent(materialId)}/media/${encodeURIComponent(name)}`,
   );
+export interface ReadingTranscript {
+  material_id: string;
+  revision: number;
+  unit_count: number;
+  truncated: boolean;
+  segments: {
+    locator: number;
+    text: string;
+    title: string;
+    source_href: string;
+  }[];
+}
+
+/**
+ * Every transcript segment of a timed material in one round trip.
+ *
+ * Segments follow the speaker's sentences, so a lecture has hundreds of them —
+ * one request each would be hundreds of requests to draw a single panel.
+ */
+export async function getReadingTranscript(
+  materialId: string,
+): Promise<ReadingTranscript> {
+  return unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/transcript`), {
+      cache: "no-store",
+    }),
+  );
 }
 
 export async function listReadingExtensions(): Promise<
@@ -319,10 +385,12 @@ export function rawMaterialUrl(materialId: string): string {
 export async function getReadingPosition(
   materialId: string,
 ): Promise<ReadingPosition> {
-  return unwrap(
-    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
-      cache: "no-store",
-    }),
+  return parseReadingPosition(
+    await unwrap(
+      await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
+        cache: "no-store",
+      }),
+    ),
   );
 }
 
@@ -330,12 +398,52 @@ export async function saveReadingPosition(
   materialId: string,
   position: Pick<ReadingPosition, "locator" | "source_anchor" | "percentage">,
 ): Promise<ReadingPosition> {
-  return unwrap(
-    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(position),
+  return parseReadingPosition(
+    await unwrap(
+      await apiFetch(apiUrl(`${BASE}/materials/${materialId}/position`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(position),
+      }),
+    ),
+  );
+}
+
+export async function listBookmarks(
+  materialId: string,
+): Promise<ReadingBookmark[]> {
+  const data = await unwrap<{ bookmarks?: ReadingBookmark[] }>(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/bookmarks`), {
+      cache: "no-store",
     }),
+  );
+  return data.bookmarks ?? [];
+}
+
+/** Keep a place. Bookmarking an already-kept locator returns that bookmark. */
+export async function addBookmark(
+  materialId: string,
+  locator: number,
+  label = "",
+): Promise<ReadingBookmark> {
+  return unwrap(
+    await apiFetch(apiUrl(`${BASE}/materials/${materialId}/bookmarks`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locator, label }),
+    }),
+  );
+}
+
+export async function deleteBookmark(
+  materialId: string,
+  bookmarkId: string,
+): Promise<void> {
+  await unwrap(
+    await apiFetch(
+      apiUrl(`${BASE}/materials/${materialId}/bookmarks/${bookmarkId}`),
+      { method: "DELETE" },
+    ),
   );
 }
 

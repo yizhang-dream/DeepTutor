@@ -2,7 +2,7 @@
 
 This replaces the deleted TutorBot engine. A partner has NO engine of its
 own: every inbound message becomes one chat turn executed by
-``ChatOrchestrator`` → ``AgenticChatPipeline`` (the exact loop the product
+``TurnEngine`` → ``AgenticChatPipeline`` (the exact loop the product
 chat uses), run inside the partner's synthetic user scope so rag / skills /
 notebook tools read the partner workspace natively.
 
@@ -47,12 +47,13 @@ from deeptutor.services.partners.interaction import (
 )
 from deeptutor.services.partners.links import linked_user_id
 from deeptutor.services.partners.scope import partner_user
-from deeptutor.services.partners.sessions import PartnerSessionStore
+from deeptutor.services.partners.sessions import PartnerSessionStore, conversation_scope
 from deeptutor.services.partners.workspace import ensure_partner_workspace, read_soul
 
 logger = logging.getLogger(__name__)
 
 EventCallback = Callable[[StreamEvent], Awaitable[None]]
+ChannelActivityCallback = Callable[[InboundMessage, dict[str, Any]], Awaitable[None]]
 
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_MEDIA_BYTES = 10 * 1024 * 1024
@@ -107,11 +108,13 @@ class PartnerRunner:
         config: Any,
         bus: MessageBus,
         save_config: Callable[[str, Any], None] | None = None,
+        on_channel_activity: ChannelActivityCallback | None = None,
     ) -> None:
         self.partner_id = partner_id
         self.config = config
         self.bus = bus
         self.save_config = save_config
+        self.on_channel_activity = on_channel_activity
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
 
@@ -134,14 +137,77 @@ class PartnerRunner:
             raise
 
     async def _handle_inbound(self, msg: InboundMessage) -> None:
+        # Every IM implementation enters through this method, so mirroring the
+        # turn here keeps WebUI behaviour consistent across WeChat, Telegram,
+        # Slack, etc.  The channel session remains authoritative for context;
+        # these frames are only an observable activity stream.
+        self._identify(msg)
+        msg.metadata = dict(msg.metadata or {})
+        activity_id = uuid.uuid4().hex
+        msg.metadata["_web_activity_id"] = activity_id
+        await self._emit_channel_activity(
+            msg,
+            {
+                "type": "user_echo",
+                "content": msg.content,
+                "activity_id": activity_id,
+                "session_key": msg.session_key,
+                "channel": msg.channel,
+                "external": True,
+            },
+        )
+
+        async def on_event(event: StreamEvent) -> None:
+            await self._emit_channel_activity(
+                msg,
+                {
+                    "type": "stream_event",
+                    "event": event.to_dict(),
+                    "activity_id": activity_id,
+                    "session_key": msg.session_key,
+                    "channel": msg.channel,
+                    "external": True,
+                },
+            )
+
         delivery_meta: dict[str, Any] = {}
         try:
-            final = await self.process_message(msg, delivery_meta=delivery_meta)
+            final = await self.process_message(
+                msg,
+                on_event=on_event,
+                delivery_meta=delivery_meta,
+            )
         except Exception as exc:
             logger.exception(
                 "Partner %s failed to process message on %s", self.partner_id, msg.channel
             )
             final = f"Sorry, something went wrong while processing your message: {exc}"
+        if self.on_channel_activity is not None:
+            # The outbound router must not send a second final-only notification
+            # after this full turn has already been mirrored.
+            delivery_meta["_web_activity_mirrored"] = True
+        if final:
+            await self._emit_channel_activity(
+                msg,
+                {
+                    "type": "content",
+                    "content": final,
+                    "activity_id": activity_id,
+                    "session_key": msg.session_key,
+                    "channel": msg.channel,
+                    "external": True,
+                },
+            )
+        await self._emit_channel_activity(
+            msg,
+            {
+                "type": "done",
+                "activity_id": activity_id,
+                "session_key": msg.session_key,
+                "channel": msg.channel,
+                "external": True,
+            },
+        )
         if final:
             await self.bus.publish_outbound(
                 OutboundMessage(
@@ -150,6 +216,19 @@ class PartnerRunner:
                     content=final,
                     metadata=delivery_meta,
                 )
+            )
+
+    async def _emit_channel_activity(self, msg: InboundMessage, frame: dict[str, Any]) -> None:
+        if self.on_channel_activity is None:
+            return
+        try:
+            await self.on_channel_activity(msg, frame)
+        except Exception:
+            # Observability must never make an IM turn fail.
+            logger.exception(
+                "Failed to mirror Partner %s activity from %s",
+                self.partner_id,
+                msg.channel,
             )
 
     # ── one turn ──────────────────────────────────────────────────
@@ -220,13 +299,24 @@ class PartnerRunner:
                 options=options,
             )
             if options.persist:
+                activity_id = str((msg.metadata or {}).get("_web_activity_id") or "").strip()
+                activity_meta = {"activity_id": activity_id} if activity_id else None
+                inbound_meta = msg.metadata or {}
                 store.append(
                     session_key,
                     "user",
                     msg.content,
                     channel=msg.channel,
                     sender_id=msg.sender_id,
-                    attachments=list((msg.metadata or {}).get("_attachment_records") or []),
+                    chat_id=msg.chat_id,
+                    scope=conversation_scope(
+                        msg.channel,
+                        str(
+                            inbound_meta.get("chat_type") or inbound_meta.get("channel_type") or ""
+                        ),
+                    ),
+                    metadata=activity_meta,
+                    attachments=list(inbound_meta.get("_attachment_records") or []),
                 )
                 if final:
                     store.append(
@@ -234,6 +324,7 @@ class PartnerRunner:
                         "assistant",
                         final,
                         channel=msg.channel,
+                        metadata=activity_meta,
                         events=turn_events or None,
                     )
             return final
@@ -308,7 +399,7 @@ class PartnerRunner:
         becomes the reply (the final outbound is then marked ``_streamed``
         so the channel doesn't send it twice).
         """
-        from deeptutor.runtime.orchestrator import ChatOrchestrator
+        from deeptutor.runtime.turn_engine import get_turn_engine
         from deeptutor.services.model_selection.runtime import (
             activate_llm_selection,
             reset_llm_selection,
@@ -368,8 +459,7 @@ class PartnerRunner:
                     legacy_own_memory=get_current_path_service(),
                 )
                 with partner_turn_context(turn_context):
-                    orchestrator = ChatOrchestrator()
-                    event_stream = orchestrator.handle(context)
+                    event_stream = get_turn_engine().execute(context)
                     async for event in event_stream:
                         if on_event is not None:
                             await on_event(event)
@@ -461,7 +551,9 @@ class PartnerRunner:
         # round. The protocol acknowledgement from that later round is never the
         # user's answer; restore the saved text at the Partner boundary.
         if context is not None:
-            group_answer = str(context.metadata.get("_partner_group_formal_answer") or "").strip()
+            group_answer = str(
+                context.extension("partner_group").get("formal_answer") or ""
+            ).strip()
             if group_answer:
                 final_text = group_answer
 

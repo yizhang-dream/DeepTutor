@@ -79,7 +79,10 @@ test("the workspace shell stays a view, with its network work in one hook", () =
 });
 
 test("reading is reachable only through its own workspace", () => {
-  const chat = source("app/(workspace)/home/[[...sessionId]]/page.tsx");
+  const chat = [
+    source("app/(workspace)/chat/page.tsx"),
+    source("app/(workspace)/chat/[sessionId]/page.tsx"),
+  ].join("\n");
   const css = source("app/globals.css");
 
   // The composer must not offer reading as a chat capability, and the chat
@@ -87,6 +90,14 @@ test("reading is reachable only through its own workspace", () => {
   assert.doesNotMatch(chat, /immersive_reading|ReaderPane/);
   assert.doesNotMatch(chat, /data-reader-open/);
   assert.doesNotMatch(css, /dt-reader-shell|--reader-width/);
+});
+
+test("reading reuses the workspace runtime without nesting another provider", () => {
+  const layout = source("app/(workspace)/reading/layout.tsx");
+
+  assert.doesNotMatch(layout, /UnifiedChatProvider|ChatRuntimeProvider/);
+  assert.match(layout, /QuizFollowupProvider/);
+  assert.match(layout, /GeogebraTabProvider/);
 });
 
 test("Reading V2 inherits product theme tokens instead of a fixed cream palette", () => {
@@ -182,4 +193,81 @@ test("uploads are checked against the library before they land", () => {
   assert.match(dialog, /checkReadingDuplicates/);
   assert.match(dialog, /same_name/);
   assert.match(dialog, /reuse: item\.decision === "reuse"/);
+});
+
+test("naming the first turn's conversation does not remount the reader", () => {
+  const hook = source(`${WORKSPACE_DIR}/useReadingWorkspace.ts`);
+  const page = source(`${WORKSPACE_DIR}/ReadingWorkspace.tsx`);
+
+  // `/reading/<ws>` and `/reading/<ws>/sessions/<id>` are different route
+  // matches, so putting the new session id in the URL through the router is a
+  // navigation: App Router tore the whole workspace down and rebuilt it while
+  // the answer was still streaming — the reader's subtree left the DOM,
+  // "Opening collection…" painted, the material was re-fetched and the page
+  // in view reset to 1. Asking the first question blinked the entire screen.
+  // Nothing moved as far as the learner is concerned, so the address bar is
+  // corrected in place instead.
+  const binding = /if \(!state\.sessionId \|\| sessionIdParam\) return;[\s\S]{0,400}?\}, \[/.exec(
+    hook,
+  );
+  assert.ok(binding, "the session-id binding effect should still be here");
+  assert.match(binding[0], /window\.history\.replaceState/);
+  assert.doesNotMatch(binding[0], /router\.(?:replace|push)/);
+
+  // And the workspace has to read the URL the same way it wrote it: route
+  // params do not follow the native history API, only the pathname does.
+  assert.match(page, /readingSessionIdFromPath\(usePathname\(\)\)/);
+  assert.doesNotMatch(page, /params\.sessionId/);
+});
+
+test("a material reopens where the reader left off", () => {
+  const pane = source("components/reading/ReaderPane.tsx");
+
+  // The position API existed and the workspace even imported it, but nothing
+  // ever called it: only EPUB (a CFI) and the media stage (a timestamp) had
+  // resume. A PDF or a web article always reopened at page 1, however far in
+  // the reader had got. This is the one place both remaining render modes
+  // pass through, so it is wired once here rather than twice below.
+  assert.match(pane, /getReadingPosition\(materialId\)/);
+  assert.match(pane, /saveReadingPosition\(materialId, \{/);
+
+  // EPUB keeps writing its own: a CFI lands inside a reflowed page, which is
+  // the difference between resuming a paragraph and resuming a chapter, and
+  // an empty `source_anchor` from here would overwrite it.
+  assert.match(pane, /material\.render_mode !== "epub"/);
+  assert.match(pane, /material\?\.render_mode === "epub"\) return;/);
+
+  // Once per material, and never over a destination the learner asked for.
+  assert.match(pane, /resumedMaterialRef\.current === materialId/);
+  assert.match(pane, /if \(pendingNavigationRef\.current\) return;/);
+
+  // The workspace shell no longer imports what it never called.
+  const shell = source(`${WORKSPACE_DIR}/ReadingWorkspace.tsx`);
+  assert.doesNotMatch(shell, /getReadingPosition|saveReadingPosition/);
+});
+
+test("bookmarks are one list, read by the toolbar and the outline", () => {
+  const hook = source(`${WORKSPACE_DIR}/useReadingWorkspace.ts`);
+  const navigator = source(`${WORKSPACE_DIR}/SourceNavigator.tsx`);
+  const pane = source("components/reading/ReaderPane.tsx");
+
+  // Two surfaces read them — "is this page kept?" on the reader's toolbar and
+  // the list itself in the outline — so the state lives in the hook they
+  // share. Two copies would diverge the moment either one added a bookmark.
+  assert.match(hook, /const bookmarks =\s*\n?\s*loadedBookmarks\.materialId === materialId/);
+  assert.match(hook, /toggleBookmark/);
+  assert.match(navigator, /bookmarks: ReadingBookmark\[\]/);
+  assert.match(pane, /bookmarks\?: ReadingBookmark\[\]/);
+  assert.doesNotMatch(navigator, /useState<ReadingBookmark/);
+  assert.doesNotMatch(pane, /useState<ReadingBookmark/);
+
+  // Distinct from the automatic position: plural, addressed by id, and
+  // labelled — an unlabelled one borrows the outline heading for its locator
+  // rather than making the reader name a place before keeping it.
+  assert.match(navigator, /row\.label \|\|/);
+  assert.match(navigator, /outline\.find\(\(entry\) => entry\.locator === row\.locator\)/);
+
+  // Its own wording, not Books' "Remove bookmark" (translated there as
+  // 取消收藏 — un-favourite, a different gesture).
+  assert.match(navigator, /t\("Remove this bookmark"\)/);
 });

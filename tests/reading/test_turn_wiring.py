@@ -20,8 +20,10 @@ from deeptutor.services.session.turn_runtime import (
     READING_SELECTION_MAX_CHARS,
     TurnRuntimeManager,
     _reading_material_id,
+    _reading_references,
     _reading_viewport,
     _request_snapshot_metadata,
+    _workspace_mode,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,19 @@ def test_selection_is_bounded_because_it_enters_the_prompt() -> None:
     assert len(viewport["selection"]) == READING_SELECTION_MAX_CHARS
 
 
+def test_explicit_reading_references_are_normalized_at_the_turn_boundary() -> None:
+    assert _reading_references(
+        [
+            {
+                "material_id": "ABCDEF0123456789",
+                "revision": 4,
+                "locators": [2, 2, "3"],
+            },
+            {"material_id": "../../etc", "revision": 1, "locators": [1]},
+        ]
+    ) == [{"material_id": "abcdef0123456789", "revision": 4, "locators": [2, 3]}]
+
+
 # ---------------------------------------------------------------------------
 # snapshot persistence
 # ---------------------------------------------------------------------------
@@ -123,6 +138,32 @@ def test_open_material_is_persisted_with_the_user_message() -> None:
     assert snapshot["readingMaterialId"] == "0123456789abcdef"
 
 
+def test_workspace_mode_is_persisted_independently_of_the_action() -> None:
+    snapshot = _snapshot(
+        {
+            "workspace_mode": "immersive_reading",
+            "reading_material_id": "0123456789abcdef",
+        }
+    )
+    assert snapshot["workspaceMode"] == "immersive_reading"
+
+
+@pytest.mark.parametrize(
+    ("value", "capability", "expected"),
+    [
+        ("immersive_reading", "deep_research", "immersive_reading"),
+        ("mastery_path", "visualize", "mastery_path"),
+        (None, "immersive_reading", "immersive_reading"),
+        (None, "mastery_path", "mastery_path"),
+        ("unknown", "chat", ""),
+    ],
+)
+def test_workspace_mode_is_orthogonal_with_legacy_fallback(
+    value: object, capability: str, expected: str
+) -> None:
+    assert _workspace_mode(value, capability=capability) == expected
+
+
 def test_a_plain_chat_turn_carries_no_reading_key() -> None:
     assert "readingMaterialId" not in _snapshot({})
     assert "readingMaterialId" not in _snapshot({"reading_material_id": ""})
@@ -150,7 +191,8 @@ async def test_empty_workspace_starts_in_no_material_mode(
         _session, turn = await runtime.start_turn(
             {
                 "type": "start_turn",
-                "capability": "immersive_reading",
+                "capability": "chat",
+                "workspace_mode": "immersive_reading",
                 "reading_workspace_id": workspace.workspace_id,
                 "content": "What can I read here?",
                 "tools": [],
@@ -162,5 +204,32 @@ async def test_empty_workspace_starts_in_no_material_mode(
         )
 
         assert runtime._executions[turn["id"]].payload["reading_material_id"] == ""
+        detail = await runtime.store.get_session(_session["id"])
+        assert detail is not None
+        assert detail["preferences"]["workspace_mode"] == "immersive_reading"
+        assert detail["preferences"]["capability"] == "chat"
     finally:
         PathService.reset_instance()
+
+
+def test_explicit_reading_references_are_persisted_for_retry() -> None:
+    snapshot = _request_snapshot_metadata(
+        content="hi",
+        capability="chat",
+        payload={},
+        attachments=[],
+        config={},
+        notebook_references=[],
+        history_references=[],
+        partner_group_references=[],
+        question_notebook_references=[],
+        book_references=[],
+        reading_references=[{"material_id": "abcdef0123456789", "revision": 1, "locators": [1, 2]}],
+        persona="",
+        memory_references=[],
+        llm_selection=None,
+    )["request_snapshot"]
+
+    assert snapshot["readingReferences"] == [
+        {"material_id": "abcdef0123456789", "revision": 1, "locators": [1, 2]}
+    ]

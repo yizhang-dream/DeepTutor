@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from deeptutor.reading.references import ResolvedReadingSource
 from deeptutor.services.session.source_inventory import (
     SourceEntry,
     SourceInventory,
@@ -158,6 +159,24 @@ def test_render_manifest_distinguishes_fresh_vs_historical() -> None:
     # source_index has full text for both
     assert idx["at-fresh"] == "hello world"
     assert idx["at-old"] == "x" * 5000
+
+
+def test_render_manifest_does_not_advertise_answer_loop_source_tools() -> None:
+    inv = SourceInventory()
+    inv.add(
+        SourceEntry(
+            sid="at-old",
+            kind="attachment",
+            name="homework.pdf",
+            full_text="PDF body",
+            fresh=False,
+            first_seen_turn=1,
+        )
+    )
+    text, _ = render_manifest(inv)
+    assert "Context Investigator" in text
+    assert "call a file/PDF tool" in text
+    assert "loaded on demand" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +445,107 @@ async def test_build_inventory_fresh_shadows_historical_on_same_sid() -> None:
     )
     assert inv.entries[0].fresh is True
     assert inv.entries[0].full_text == "fresh body"
+
+
+@pytest.mark.asyncio
+async def test_build_inventory_adds_server_resolved_reading_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.services.session import source_inventory
+
+    seen: list[dict[str, Any]] = []
+
+    def resolve(refs: list[dict[str, Any]]) -> list[ResolvedReadingSource]:
+        seen.extend(refs)
+        return [
+            ResolvedReadingSource(
+                source_id="rd-abcdef0123456789-r3-2",
+                name="Source book — Chapter 2",
+                full_text="trusted chapter text",
+            )
+        ]
+
+    monkeypatch.setattr(source_inventory, "resolve_reading_sources", resolve)
+    inv = await build_inventory(
+        FakeStore(),
+        session_id="s1",
+        leaf_message_id=None,
+        current_turn_ordinal=1,
+        fresh_attachment_records=[],
+        fresh_notebook_records=[],
+        fresh_book_context_text="",
+        fresh_book_references=[],
+        fresh_history_session_ids=[],
+        fresh_question_entry_ids=[],
+        fresh_reading_references=[
+            {"material_id": "abcdef0123456789", "revision": 3, "locators": [2]}
+        ],
+    )
+
+    assert seen == [{"material_id": "abcdef0123456789", "revision": 3, "locators": [2]}]
+    assert inv.entries[0].sid == "rd-abcdef0123456789-r3-2"
+    assert inv.entries[0].kind == "reading"
+    assert inv.entries[0].fresh is True
+
+
+@pytest.mark.asyncio
+async def test_historical_reading_units_are_re_resolved_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.services.session import source_inventory
+
+    monkeypatch.setattr(
+        source_inventory,
+        "resolve_reading_sources",
+        lambda refs: (
+            [
+                ResolvedReadingSource(
+                    source_id="rd-abcdef0123456789-r2-1",
+                    name="Source book — Chapter 1",
+                    full_text="current stored chapter text",
+                )
+            ]
+            if refs
+            else []
+        ),
+    )
+    store = FakeStore(
+        messages=[
+            {
+                "id": 1,
+                "role": "user",
+                "parent_message_id": None,
+                "attachments": [],
+                "metadata": {
+                    "request_snapshot": {
+                        "readingReferences": [
+                            {
+                                "material_id": "abcdef0123456789",
+                                "revision": 2,
+                                "locators": [1],
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+    )
+
+    inv = await build_inventory(
+        store,
+        session_id="s1",
+        leaf_message_id=None,
+        current_turn_ordinal=2,
+        fresh_attachment_records=[],
+        fresh_notebook_records=[],
+        fresh_book_context_text="",
+        fresh_book_references=[],
+        fresh_history_session_ids=[],
+        fresh_question_entry_ids=[],
+    )
+
+    assert inv.entries[0].fresh is False
+    assert inv.entries[0].full_text == "current stored chapter text"
 
 
 # ---------------------------------------------------------------------------

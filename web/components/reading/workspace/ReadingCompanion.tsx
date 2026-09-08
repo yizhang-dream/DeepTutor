@@ -7,9 +7,9 @@
  * conversation needs is imported from the main chat page's own components
  * rather than reimplemented at 380 px: `ChatMessageList` renders the
  * transcript, `useChatAutoScroll` pins it while a reply streams,
- * `ReadingComposer` wraps the same composer /home uses, `SessionViewerPanel`
+ * `ReadingComposer` wraps the same composer /chat uses, `SessionViewerPanel`
  * is the same activity drawer, and the transcript outline comes from the same
- * `buildChatOutline`. When those change on /home, they change here.
+ * `buildChatOutline`. When those change on /chat, they change here.
  *
  * What is genuinely local to reading is the small part that is left: which
  * material is open, the passage the learner has selected, the conversations
@@ -37,16 +37,26 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { ChatMessageList } from "@/components/chat/home/ChatMessages";
+import { ChatMessageList } from "@/features/chat/messages";
 import { buildSessionActivity } from "@/components/chat/home/SessionActivityPanel";
-import SessionViewerPanel from "@/components/chat/home/SessionViewerPanel";
+import SessionViewerPanel, {
+  type SessionViewerPanelHandle,
+} from "@/components/chat/home/SessionViewerPanel";
+import { ChatViewerBridges } from "@/components/chat/home/ChatViewerBridges";
 import Tooltip from "@/components/common/Tooltip";
-import { useUnifiedChat } from "@/context/UnifiedChatContext";
+import {
+  type MessageAttachment,
+  useChatStateAdapter,
+} from "@/features/chat/ChatStateAdapter";
 import { useChatAutoScroll } from "@/hooks/useChatAutoScroll";
 import { useMeasuredHeight } from "@/hooks/useMeasuredHeight";
-import { buildChatOutline } from "@/lib/chat-outline";
+import { useResearchOutlineContinuation } from "@/hooks/useResearchOutlineContinuation";
+import { buildChatOutline, scrollToChatTurn } from "@/lib/chat-outline";
 import { downloadChatMarkdown } from "@/lib/chat-export";
+import { copyText } from "@/lib/clipboard";
+import { buildConversationNotebookSave } from "@/lib/conversation-notebook-save";
 import { setReadingViewport } from "@/lib/reading-turn-state";
+import { workspaceActionNeedsConfiguration } from "@/lib/workspace-mode";
 import {
   fetchReadingAskHint,
   fetchReadingOpeners,
@@ -112,21 +122,47 @@ export function ReadingCompanion({
     deleteTurn,
     editMessage,
     switchBranch,
-  } = useUnifiedChat();
+    loadMessageTrace,
+    releaseMessageTrace,
+  } = useChatStateAdapter();
+  const confirmResearchOutline = useResearchOutlineContinuation();
 
   const [showSessions, setShowSessions] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuView, setMenuView] = useState<MenuView>("actions");
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
+  const viewerPanelRef = useRef<SessionViewerPanelHandle | null>(null);
+
+  // Attachment cards were rendered without a click handler here, so a
+  // generated file or image in the transcript simply did nothing when
+  // clicked. The viewer panel below is already mounted; this opens the
+  // attachment in it, the same way chat does.
+  const handlePreviewMessageAttachment = useCallback(
+    (attachment: MessageAttachment) => {
+      viewerPanelRef.current?.openFileTab(attachment);
+    },
+    [],
+  );
 
   const closeMenu = useCallback(() => {
     setMenuOpen(false);
     setMenuView("actions");
   }, []);
 
+  const handleWelcomeAction = useCallback(
+    (prompt: string) => {
+      if (workspaceActionNeedsConfiguration(state.activeCapability)) {
+        prefillInputRef.current?.(prompt);
+        return;
+      }
+      onQuickPrompt(prompt);
+    },
+    [onQuickPrompt, prefillInputRef, state.activeCapability],
+  );
+
   /* ── Transcript scrolling ────────────────────────────────────────────
-     The pin-to-bottom hook /home uses. The companion used to be a bare
+     The pin-to-bottom hook /chat uses. The companion used to be a bare
      `overflow-y-auto`, so a streaming reply grew below the fold while the
      viewport sat still and the answer looked like it had stopped. */
   const { ref: composerBoxRef, height: composerHeight } =
@@ -147,7 +183,7 @@ export function ReadingCompanion({
   });
 
   // Binding a session id mid-answer changes the URL from `/reading/<ws>` to
-  // `/reading/<ws>/<id>`, which remounts this panel: the new instance
+  // `/reading/<ws>/sessions/<id>`, which remounts this panel: the new instance
   // inherits a turn that is already streaming, but its scrollport starts at
   // the top, so the reply the learner just asked for renders below the fold.
   // Arming the pin at the start of every turn is right on its own terms too —
@@ -160,7 +196,7 @@ export function ReadingCompanion({
   }, [messagesContainerRef, shouldAutoScrollRef, state.isStreaming]);
 
   /* ── Going back through a long conversation ──────────────────────────
-     Same model as /home's turn rail, different presentation: that rail
+     Same model as /chat's turn rail, different presentation: that rail
      needs a 52 px gutter it will never get in a 380 px panel, so the
      questions are listed in the header menu instead. */
   const chatOutline = useMemo(
@@ -171,20 +207,10 @@ export function ReadingCompanion({
   const jumpToTurn = useCallback(
     (key: string) => {
       const container = messagesContainerRef.current;
-      const target = container?.querySelector<HTMLElement>(
-        `[data-turn-key="${key}"]`,
-      );
-      if (!container || !target) return;
-      // Release the pin first, or the next streamed delta snaps the reader
-      // straight back to the bottom they just navigated away from.
-      shouldAutoScrollRef.current = false;
-      const offset =
-        target.getBoundingClientRect().top -
-        container.getBoundingClientRect().top;
-      container.scrollTo({
-        top: container.scrollTop + offset - 12,
-        behavior: "smooth",
-      });
+      if (scrollToChatTurn(container, key, { topOffset: 12 })) {
+        // Release the pin, or the next streamed delta snaps the reader back.
+        shouldAutoScrollRef.current = false;
+      }
     },
     [messagesContainerRef, shouldAutoScrollRef],
   );
@@ -246,55 +272,35 @@ export function ReadingCompanion({
     };
   }, [activeLocator, hasMessages, workspaceId]);
 
-  /* ── Session-level actions, the same three /home puts in its header ── */
-  const chatSaveMessages = useMemo(
-    () =>
-      state.messages.map((message) => ({
-        role: message.role,
-        content: message.content,
-        capability: message.capability,
-      })),
-    [state.messages],
-  );
-
-  const chatSavePayload = useMemo(() => {
-    if (!state.messages.length) return null;
-    return {
-      recordType: "chat" as const,
-      title:
-        state.messages
-          .find((message) => message.role === "user")
-          ?.content.trim()
-          .slice(0, 80) ||
-        material?.title ||
-        "Reading conversation",
-      // Rebuilt inside the modal from the subset the learner ticks.
-      userQuery: "",
-      output: "",
-      metadata: {
-        source: "immersive_reading",
-        capability: state.activeCapability || "immersive_reading",
-        ui_language: state.language,
-        session_id: state.sessionId,
-        total_message_count: state.messages.length,
-      },
-    };
-  }, [
-    material?.title,
-    state.activeCapability,
-    state.language,
-    state.messages,
-    state.sessionId,
-  ]);
+  /* ── Session-level actions, the same three /chat puts in its header ── */
+  const { modalMessages: chatSaveMessages, payload: chatSavePayload } =
+    useMemo(
+      () =>
+        buildConversationNotebookSave(state.messages, {
+          source: "immersive_reading",
+          fallbackTitle: material?.title || "Reading conversation",
+          activeCapability: state.activeCapability,
+          language: state.language,
+          sessionId: state.sessionId,
+        }),
+      [
+        material?.title,
+        state.activeCapability,
+        state.language,
+        state.messages,
+        state.sessionId,
+      ],
+    );
 
   const sessionActivity = useMemo(
     () => buildSessionActivity(state.messages),
     [state.messages],
   );
 
-  const copyAssistantMessage = useCallback(async (content: string) => {
-    await navigator.clipboard.writeText(content);
-  }, []);
+  const copyAssistantMessage = useCallback(
+    (content: string) => copyText(content),
+    [],
+  );
 
   return (
     <aside className="absolute inset-y-0 right-0 z-30 flex w-[min(420px,100%)] min-h-0 min-w-0 flex-col bg-[var(--card)] shadow-[-18px_0_42px_rgba(0,0,0,.12)] dark:bg-[var(--background)] xl:static xl:w-auto xl:shadow-none">
@@ -314,7 +320,9 @@ export function ReadingCompanion({
             label={
               activeConversation
                 ? t("Link earlier reading conversations")
-                : t("Send a message first, then link earlier reading conversations")
+                : t(
+                    "Send a message first, then link earlier reading conversations",
+                  )
             }
           >
             <button
@@ -497,7 +505,9 @@ export function ReadingCompanion({
           const container = messagesContainerRef.current;
           if (!container) return;
           const distanceFromBottom =
-            container.scrollHeight - container.scrollTop - container.clientHeight;
+            container.scrollHeight -
+            container.scrollTop -
+            container.clientHeight;
           // Arm-only while streaming: the exported handler decides "did the
           // user move?" by distance-from-bottom alone, a fine proxy in a
           // 960px column but not in this 380px one — a single paragraph
@@ -530,12 +540,24 @@ export function ReadingCompanion({
             onEditMessage={editMessage}
             onSwitchBranch={switchBranch}
             onSubmitUserReply={submitUserReply}
+            onConfirmOutline={confirmResearchOutline}
+            onPreviewAttachment={handlePreviewMessageAttachment}
+            onLoadMessageTrace={(messageId) =>
+              state.sessionId
+                ? loadMessageTrace(state.sessionId, messageId)
+                : Promise.resolve()
+            }
+            onReleaseMessageTrace={(messageId) => {
+              if (state.sessionId) {
+                releaseMessageTrace(state.sessionId, messageId);
+              }
+            }}
             showModeBadge={false}
           />
         ) : (
           <CompanionWelcome
             title={material?.title ?? ""}
-            onAction={onQuickPrompt}
+            onAction={handleWelcomeAction}
             suggestions={openers}
           />
         )}
@@ -548,7 +570,10 @@ export function ReadingCompanion({
       >
         {selection && (
           <div className="mx-4 mb-2 flex items-start gap-2 rounded-xl border border-[var(--border)] bg-[var(--card)] px-2.5 py-2 dark:border-[var(--border)] dark:bg-[var(--card)]">
-            <Highlighter size={12} className="mt-0.5 shrink-0 text-[var(--primary)]" />
+            <Highlighter
+              size={12}
+              className="mt-0.5 shrink-0 text-[var(--primary)]"
+            />
             <p className="line-clamp-2 min-w-0 flex-1 text-[10.5px] leading-relaxed text-[var(--muted-foreground)]">
               {selection.quote}
             </p>
@@ -590,16 +615,18 @@ export function ReadingCompanion({
         onClose={() => setShowSaveModal(false)}
       />
 
-      {/* Fixed right-hand drawer, the same component /home opens. It overlays
+      {/* Fixed right-hand drawer, the same component /chat opens. It overlays
           the companion rather than squeezing it: at this width a third column
           would leave nothing readable. */}
       <SessionViewerPanel
+        ref={viewerPanelRef}
         open={viewerOpen}
         sessionId={state.sessionId}
         activity={sessionActivity}
         onClose={() => setViewerOpen(false)}
         onAutoOpen={() => setViewerOpen(true)}
       />
+      <ChatViewerBridges viewerPanelRef={viewerPanelRef} />
     </aside>
   );
 }

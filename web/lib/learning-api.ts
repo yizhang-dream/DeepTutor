@@ -37,14 +37,14 @@ export interface ProgressDetail {
 }
 
 export async function fetchProgress(bookId: string): Promise<ProgressDetail> {
-  const res = await apiFetch(apiUrl(`/api/v1/learning/progress/${bookId}`));
+  const res = await apiFetch(apiUrl(`/api/mastery-paths/progress/${bookId}`));
   if (!res.ok) throw new Error(`Failed to fetch progress: ${res.status}`);
   return res.json() as Promise<ProgressDetail>;
 }
 
 export async function initModules(bookId: string, modules: ModuleInit[]) {
   const res = await apiFetch(
-    apiUrl(`/api/v1/learning/progress/${bookId}/init-modules`),
+    apiUrl(`/api/mastery-paths/progress/${bookId}/init-modules`),
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -73,6 +73,12 @@ export interface MapKnowledgePoint {
 export interface MapModule {
   id: string;
   name: string;
+  /**
+   * What this module is for, in one sentence, written when the outline was
+   * designed. Empty on outlines built before module objectives existed — every
+   * reader falls back to the module name.
+   */
+  objective: string;
   order: number;
   mastered: number;
   total: number;
@@ -112,22 +118,67 @@ export interface MasteryMapResult {
   map: MasteryMap;
 }
 
+// ── Visual learning board ─────────────────────────────────────────────────
+
+export interface BoardCard {
+  id: string;
+  name: string;
+  type: string;
+  module_id: string;
+  module_name: string;
+  status: ObjectiveStatus;
+  mastery_level: number;
+  next_review_at: number | null;
+  position: { column: number; row: number };
+}
+
+export interface BoardModule {
+  id: string;
+  name: string;
+  order: number;
+  mastered: number;
+  total: number;
+  cards: BoardCard[];
+}
+
+export interface BoardResult {
+  book_id: string;
+  name: string;
+  path_revision: number;
+  cards: BoardCard[];
+  modules: BoardModule[];
+}
+
 export async function fetchMasteryMap(
   pathId: string,
   init?: RequestInit,
 ): Promise<MasteryMapResult> {
   const res = await apiFetch(
-    apiUrl(`/api/v1/learning/progress/${encodeURIComponent(pathId)}/map`),
+    apiUrl(`/api/mastery-paths/progress/${encodeURIComponent(pathId)}/map`),
     init,
   );
   if (!res.ok) throw new Error(`Failed to fetch mastery map: ${res.status}`);
   return res.json() as Promise<MasteryMapResult>;
 }
 
+export async function fetchLearningBoard(
+  pathId: string,
+  init?: RequestInit,
+): Promise<BoardResult> {
+  const res = await apiFetch(
+    apiUrl(
+      `/api/mastery-paths/progress/${encodeURIComponent(pathId)}/board`,
+    ),
+    init,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch learning board: ${res.status}`);
+  return res.json() as Promise<BoardResult>;
+}
+
 /** Rename a path. An empty name restores the derived display name. */
 export async function renameProgress(pathId: string, name: string) {
   const res = await apiFetch(
-    apiUrl(`/api/v1/learning/progress/${encodeURIComponent(pathId)}`),
+    apiUrl(`/api/mastery-paths/progress/${encodeURIComponent(pathId)}`),
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -160,7 +211,7 @@ export async function fetchProgressEvents(
 ): Promise<MasteryEvent[]> {
   const res = await apiFetch(
     apiUrl(
-      `/api/v1/learning/progress/${encodeURIComponent(pathId)}/events?after_revision=${afterRevision}`,
+      `/api/mastery-paths/progress/${encodeURIComponent(pathId)}/events?after_revision=${afterRevision}`,
     ),
     init,
   );
@@ -223,7 +274,7 @@ export async function fetchObjectiveReport(
 ): Promise<ObjectiveReport> {
   const res = await apiFetch(
     apiUrl(
-      `/api/v1/learning/progress/${encodeURIComponent(pathId)}/objectives/${encodeURIComponent(objectiveId)}`,
+      `/api/mastery-paths/progress/${encodeURIComponent(pathId)}/objectives/${encodeURIComponent(objectiveId)}`,
     ),
     init,
   );
@@ -247,14 +298,14 @@ export interface ProgressListResult {
 }
 
 export async function fetchAllProgress(): Promise<ProgressListResult> {
-  const res = await apiFetch(apiUrl("/api/v1/learning/progress"));
+  const res = await apiFetch(apiUrl("/api/mastery-paths/progress"));
   if (!res.ok) throw new Error(`Failed to fetch all progress: ${res.status}`);
   return res.json();
 }
 
 export async function deleteProgress(bookId: string) {
   const res = await apiFetch(
-    apiUrl(`/api/v1/learning/progress/${encodeURIComponent(bookId)}`),
+    apiUrl(`/api/mastery-paths/progress/${encodeURIComponent(bookId)}`),
     { method: "DELETE" },
   );
   if (!res.ok) throw new Error(`Failed to delete progress: ${res.status}`);
@@ -263,7 +314,7 @@ export async function deleteProgress(bookId: string) {
 
 export async function redoProgress(bookId: string) {
   const res = await apiFetch(
-    apiUrl(`/api/v1/learning/progress/${encodeURIComponent(bookId)}/redo`),
+    apiUrl(`/api/mastery-paths/progress/${encodeURIComponent(bookId)}/redo`),
     { method: "POST" },
   );
   if (!res.ok) throw new Error(`Failed to redo progress: ${res.status}`);
@@ -274,7 +325,7 @@ export async function redoProgress(bookId: string) {
 export async function skipPendingQuestion(bookId: string) {
   const res = await apiFetch(
     apiUrl(
-      `/api/v1/learning/progress/${encodeURIComponent(bookId)}/skip-question`,
+      `/api/mastery-paths/progress/${encodeURIComponent(bookId)}/skip-question`,
     ),
     { method: "POST" },
   );
@@ -288,7 +339,7 @@ export async function importFromBook(
 ) {
   const res = await apiFetch(
     apiUrl(
-      `/api/v1/learning/progress/${encodeURIComponent(bookId)}/import-from-book`,
+      `/api/mastery-paths/progress/${encodeURIComponent(bookId)}/import-from-book`,
     ),
     {
       method: "POST",
@@ -307,7 +358,7 @@ export async function generateModulesFromNotebook(
 ): Promise<{ modules: ModuleInit[] }> {
   const res = await apiFetch(
     apiUrl(
-      `/api/v1/learning/progress/${encodeURIComponent(bookId)}/generate-from-notebook`,
+      `/api/mastery-paths/progress/${encodeURIComponent(bookId)}/generate-from-notebook`,
     ),
     {
       method: "POST",
@@ -322,13 +373,17 @@ export async function generateModulesFromNotebook(
 
 // ── Mastery Path V2 product surface ──────────────────────────────────────
 
+// Mirrors deeptutor/learning/models.py TopicSourceKind.
 export type TopicSourceKind =
   | "goal"
   | "book"
   | "notebook"
   | "knowledge_base"
   | "file"
-  | "chat";
+  | "chat"
+  | "question_bank"
+  | "cowriter"
+  | "partner_group";
 
 export interface TopicSource {
   id: string;
@@ -382,8 +437,31 @@ export interface MasteryTopic {
   next: NextStep;
   map: MasteryMap;
   reviews: TopicReview[];
+  /** Null until the tutor has asked the learner about themselves. */
+  learner_profile: LearnerProfile | null;
   session_count: number;
   updated_at: number;
+}
+
+/** One selected document the generated outline did not account for. */
+export interface TopicCoverageGap {
+  /** The source it came from — a knowledge base name, or a file's own label. */
+  label: string;
+  document: string;
+}
+
+/**
+ * How much of the learner's selected material the outline accounts for.
+ *
+ * `reported: false` means the model named no materials at all, so nothing can
+ * be concluded — showing every document as missed would send the learner
+ * regenerating an outline that may already cover them.
+ */
+export interface TopicCoverage {
+  documents: number;
+  covered: number;
+  missing: TopicCoverageGap[];
+  reported: boolean;
 }
 
 export interface TopicDraft {
@@ -391,18 +469,39 @@ export interface TopicDraft {
   modules: ModuleInit[];
   /** Server-hydrated source states (for example KB retrieval availability). */
   sources?: TopicSourceInput[];
+  /** Regions this material justifies — scales with the documents selected. */
+  module_limit?: number;
+  coverage?: TopicCoverage;
 }
 
 export interface GenerateTopicInput {
   name: string;
   goal: string;
   sources: TopicSourceInput[];
+  /** Documents a previous draft missed, to be covered by this one. */
+  must_cover?: string[];
 }
 
-export interface CreateTopicInput extends GenerateTopicInput {
+export interface CreateTopicInput extends Omit<GenerateTopicInput, "name"> {
+  /**
+   * Optional: a goal the learner did not name is named after its own goal
+   * text, server-side, and stays renameable afterwards.
+   */
+  name?: string;
   description?: string;
   emoji?: string;
+  /** Empty when the outline is to be designed in the goal's first session. */
   modules: ModuleInit[];
+}
+
+/** Mirrors deeptutor/learning/models.py LearnerProfile. */
+export interface LearnerProfile {
+  prior_knowledge: string;
+  target_level: string;
+  time_budget: string;
+  preferences: string;
+  notes: string;
+  updated_at: number;
 }
 
 export interface TopicSession {
@@ -442,7 +541,7 @@ export async function fetchMasteryTopics(
   init?: RequestInit,
 ): Promise<MasteryTopic[]> {
   const result = await masteryJson<{ topics: MasteryTopic[] }>(
-    "/api/v1/learning/topics",
+    "/api/mastery-paths/topics",
     init,
     "load topics",
   );
@@ -472,7 +571,7 @@ export async function fetchMasteryTopicIndex(
   init?: RequestInit,
 ): Promise<MasteryTopicLabel[]> {
   const result = await masteryJson<{ topics: MasteryTopicLabel[] }>(
-    "/api/v1/learning/topics/index",
+    "/api/mastery-paths/topics/index",
     init,
     "load topic index",
   );
@@ -487,7 +586,7 @@ export async function fetchMasteryAskHint(
 ): Promise<string> {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
   const result = await masteryJson<{ hint?: string }>(
-    `/api/v1/learning/topics/${encodeURIComponent(pathId)}/ask-hint${query}`,
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/ask-hint${query}`,
     init,
     "load ask hint",
   );
@@ -499,9 +598,27 @@ export function fetchMasteryTopic(
   init?: RequestInit,
 ): Promise<MasteryTopic> {
   return masteryJson(
-    `/api/v1/learning/topics/${encodeURIComponent(pathId)}`,
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}`,
     init,
     "load topic",
+  );
+}
+
+/** Change what a conversation is doing, from the learner's own mode buttons. */
+export async function setMasterySessionMode(
+  pathId: string,
+  sessionId: string,
+  mode: string,
+): Promise<{ session_id: string; mode: string }> {
+  return masteryJson(
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/sessions/${encodeURIComponent(
+      sessionId,
+    )}/mode`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    },
   );
 }
 
@@ -509,7 +626,7 @@ export function generateMasteryTopicDraft(
   input: GenerateTopicInput,
 ): Promise<TopicDraft> {
   return masteryJson(
-    "/api/v1/learning/topics/draft",
+    "/api/mastery-paths/topics/draft",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -523,7 +640,7 @@ export function createMasteryTopic(
   input: CreateTopicInput,
 ): Promise<MasteryTopic> {
   return masteryJson(
-    "/api/v1/learning/topics",
+    "/api/mastery-paths/topics",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -538,7 +655,7 @@ export function updateMasteryTopicMap(
   modules: ModuleInit[],
 ): Promise<MasteryTopic> {
   return masteryJson(
-    `/api/v1/learning/topics/${encodeURIComponent(pathId)}/map`,
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/map`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -555,7 +672,7 @@ export function setMasteryObjectiveOverride(
   note = "",
 ): Promise<{ status: string; path_revision: number; map: MasteryMap }> {
   return masteryJson(
-    `/api/v1/learning/topics/${encodeURIComponent(pathId)}/objectives/${encodeURIComponent(objectiveId)}/override`,
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/objectives/${encodeURIComponent(objectiveId)}/override`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -573,7 +690,7 @@ export async function fetchMasteryTopicSessions(
     path_id: string;
     sessions: TopicSession[];
   }>(
-    `/api/v1/learning/topics/${encodeURIComponent(pathId)}/sessions`,
+    `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/sessions`,
     init,
     "load topic sessions",
   );

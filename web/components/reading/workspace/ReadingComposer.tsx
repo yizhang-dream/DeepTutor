@@ -13,12 +13,18 @@
  */
 
 import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
 
 import StandaloneComposer, {
   type StandaloneComposerSubmission,
 } from "@/components/chat/home/StandaloneComposer";
-import { useUnifiedChat } from "@/context/UnifiedChatContext";
-import { hasPendingAskUser } from "@/lib/ask-user-state";
+import { useChatStateAdapter } from "@/features/chat/ChatStateAdapter";
+import { useWorkspaceChatActions } from "@/hooks/useWorkspaceChatActions";
+import {
+  hasPendingAskUser,
+  REPLY_SENT_AS_NEW_MESSAGE,
+} from "@/lib/ask-user-state";
+import { notify } from "@/lib/notifications";
 import { setReadingViewport } from "@/lib/reading-turn-state";
 
 export function ReadingComposer({
@@ -48,7 +54,10 @@ export function ReadingComposer({
     setKBs,
     setLLMSelection,
     setPersonaSelection,
-  } = useUnifiedChat();
+  } = useChatStateAdapter();
+  const { capabilities, activeCapabilityValue, selectCapability } =
+    useWorkspaceChatActions();
+  const { t } = useTranslation();
 
   const awaitingUserReply = hasPendingAskUser(
     state.messages[state.messages.length - 1]?.events,
@@ -56,43 +65,54 @@ export function ReadingComposer({
 
   const handleSubmit = useCallback(
     (submission: StandaloneComposerSubmission) => {
-      // A turn paused on a question: what the user typed is their answer,
-      // not a new message. See page.tsx's handleSend for the same routing.
-      if (awaitingUserReply) {
-        if (submission.content.trim()) {
-          submitUserReply({ text: submission.content });
+      const sendAsNewMessage = () => {
+        if (selection) {
+          setReadingViewport({
+            locator: selection.locator,
+            selection: selection.quote,
+          });
         }
+        // The composer's own "@ reference an earlier session" picker and this
+        // surface's persistent linked-conversations list share one wire slot;
+        // union them rather than letting either silently win.
+        const historyReferences = Array.from(
+          new Set([...linkedSessionIds, ...submission.historyReferences]),
+        );
+        sendMessage(
+          submission.content,
+          submission.attachments,
+          // How many times the companion may consult the selected agent this
+          // turn. Absent when no agent is picked, which is the ordinary case.
+          submission.subagentBudget
+            ? {
+                ...(submission.config ?? {}),
+                subagent_consult_budget: submission.subagentBudget,
+              }
+            : submission.config,
+          submission.notebookReferences,
+          historyReferences,
+          { bookReferences: submission.bookReferences },
+          submission.questionNotebookReferences,
+          submission.persona ?? undefined,
+          submission.memoryReferences,
+        );
+        onSent();
+        window.setTimeout(() => setReadingViewport({ selection: "" }), 0);
+      };
+
+      // A turn paused on a question: what the reader typed is their answer,
+      // not a new message. See ChatWorkspace's handleSend for the same routing
+      // — including the fall-through on a refusal, which is what keeps a dead
+      // question from swallowing the text they just wrote.
+      if (awaitingUserReply && submission.content.trim()) {
+        void submitUserReply({ text: submission.content }).then((sent) => {
+          if (sent) return;
+          notify(t(REPLY_SENT_AS_NEW_MESSAGE));
+          sendAsNewMessage();
+        });
         return;
       }
-      if (selection) {
-        setReadingViewport({
-          locator: selection.locator,
-          selection: selection.quote,
-        });
-      }
-      // The composer's own "@ reference an earlier session" picker and this
-      // surface's persistent linked-conversations list share one wire slot;
-      // union them rather than letting either silently win.
-      const historyReferences = Array.from(
-        new Set([...linkedSessionIds, ...submission.historyReferences]),
-      );
-      sendMessage(
-        submission.content,
-        submission.attachments,
-        // How many times the companion may consult the selected agent this
-        // turn. Absent when no agent is picked, which is the ordinary case.
-        submission.subagentBudget
-          ? { subagent_consult_budget: submission.subagentBudget }
-          : undefined,
-        submission.notebookReferences,
-        historyReferences,
-        { bookReferences: submission.bookReferences },
-        submission.questionNotebookReferences,
-        submission.persona ?? undefined,
-        submission.memoryReferences,
-      );
-      onSent();
-      window.setTimeout(() => setReadingViewport({ selection: "" }), 0);
+      sendAsNewMessage();
     },
     [
       awaitingUserReply,
@@ -101,14 +121,16 @@ export function ReadingComposer({
       selection,
       sendMessage,
       submitUserReply,
+      t,
     ],
   );
 
   return (
     <StandaloneComposer
-      // The active material is named in the header above; a capability chip
-      // here would only repeat it.
-      showCapabilityChip={false}
+      capabilities={capabilities}
+      activeCapValue={activeCapabilityValue}
+      onSelectCapability={selectCapability}
+      showCapabilityChip
       hasMessages={state.messages.length > 0}
       isStreaming={state.isStreaming}
       awaitingUserReply={awaitingUserReply}

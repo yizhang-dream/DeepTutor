@@ -40,12 +40,21 @@ _CUSTOM_MODEL_THINKING_STYLES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("qwen3", "qwen-3", "qwq", "qwen-plus"), "enable_thinking"),
     (("deepseek-v4-pro", "deepseek-reasoner", "deepseek-r1"), "thinking_type"),
 )
-# Model substrings that default to thinking off — independent of binding name,
-# so ``LLM_BINDING=openai`` pointed at DeepSeek with deepseek-v4-flash still
-# sends ``thinking: disabled`` and avoids the mid-conversation
-# ``reasoning_content must be passed back`` 400 (#1058).
-_THINKING_DISABLED_BY_DEFAULT_MODELS: tuple[str, ...] = ("deepseek-v4-flash",)
-_THINKING_DISABLED_BY_DEFAULT: tuple[tuple[str, str], ...] = (("deepseek", "deepseek-v4-flash"),)
+# Models we send an explicit "thinking off" to, by model substring and by
+# (provider, model) pair. Both are deliberately EMPTY.
+#
+# ``deepseek-v4-flash`` used to be listed here to dodge the mid-conversation
+# ``reasoning_content must be passed back`` 400 (#1058). That is not what fixes
+# it — echoing the previous round's reasoning on the assistant turn that issued
+# the tool calls is, and that landed in the same change (see
+# ``assistant_message_with_tool_calls``). Keeping the switch off as well bought
+# nothing and cost every flash user their entire reasoning stream: the model
+# emits reasoning happily, and we were the ones suppressing it.
+#
+# Add a model here only when the provider itself cannot be made to work with
+# thinking on — not to work around a payload we control.
+_THINKING_DISABLED_BY_DEFAULT_MODELS: tuple[str, ...] = ()
+_THINKING_DISABLED_BY_DEFAULT: tuple[tuple[str, str], ...] = ()
 
 
 def _spec_name(spec: Any, binding: str | None) -> str:
@@ -61,7 +70,7 @@ def _custom_thinking_style(model_name: str) -> tuple[str, tuple[str, ...]]:
     for patterns, style in _CUSTOM_MODEL_THINKING_STYLES:
         if _matches(model_name, patterns):
             return style, patterns
-    # Flash needs thinking_type so we can send ``disabled`` by default, but it
+    # A model listed as thinking-off needs a style to express that in, but it
     # must NOT inherit the high-effort patterns used by pro/reasoner.
     if any(pattern in model_name.lower() for pattern in _THINKING_DISABLED_BY_DEFAULT_MODELS):
         return "thinking_type", ()
@@ -81,13 +90,12 @@ def _disable_thinking_by_default(provider_name: str, model_name: str) -> bool:
 def default_reasoning_effort_for(provider: str | None, model: str | None) -> str | None:
     """Return the implicit ``reasoning_effort`` for ``provider``/``model``, if any.
 
-    Used by callers that don't go through :func:`build_openai_compatible_reasoning_kwargs`
-    (currently the openai-SDK path in ``executors.py`` and the aiohttp fallback
-    in ``cloud_provider.py``). Returns ``None`` when no default applies — the
-    caller should leave the field unset in that case.
+    Used by callers that don't go through :func:`build_openai_compatible_reasoning_kwargs`.
+    Returns ``None`` when no default applies — the caller should leave the field
+    unset in that case.
 
-    The single source of truth is :data:`_PROVIDER_DEFAULT_OFF_PATTERNS` so all
-    three execution paths agree on which models need thinking disabled by default.
+    The single source of truth is :data:`_PROVIDER_DEFAULT_OFF_PATTERNS` so every
+    execution path agrees on which models need thinking disabled by default.
     """
     provider_name = (provider or "").strip().lower()
     off_patterns = _PROVIDER_DEFAULT_OFF_PATTERNS.get(provider_name)

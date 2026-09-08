@@ -1,5 +1,7 @@
 "use client";
 
+import { browserStorage } from "@/shared/storage";
+
 /**
  * The workspace feature list — the part of the sidebar a learner owns.
  *
@@ -15,6 +17,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -98,7 +101,7 @@ export function SidebarNav({
     if (typeof window === "undefined") return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLayout(readNavLayout());
-    setMoreExpanded(window.localStorage.getItem(MORE_EXPANDED_KEY) === "1");
+    setMoreExpanded(browserStorage.readRaw("local", MORE_EXPANDED_KEY) === "1");
   }, []);
 
   const resolved = useMemo(
@@ -119,7 +122,7 @@ export function SidebarNav({
   const showMore = useCallback((next: boolean) => {
     setMoreExpanded(next);
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(MORE_EXPANDED_KEY, next ? "1" : "0");
+      browserStorage.writeRaw("local", MORE_EXPANDED_KEY, next ? "1" : "0");
     }
   }, []);
 
@@ -257,7 +260,7 @@ export function SidebarNav({
                       href={href}
                       onClick={(event) => {
                         closeMenus();
-                        if (href === "/home") onHomeClick(event);
+                        if (href === "/chat") onHomeClick(event);
                         else onNavigate(event);
                       }}
                       role="menuitem"
@@ -308,13 +311,13 @@ export function SidebarNav({
     const { style, ...handlers } = drag.getItemProps(href);
     const label = t(entry.label);
     const body = (
-      <>
+      <Fragment key={`${href}-content`}>
         <Icon size={16} strokeWidth={active ? 1.9 : 1.5} className="shrink-0" />
         <span className="min-w-0 flex-1 truncate">{label}</span>
         {locked ? (
           <Lock size={13} strokeWidth={1.8} className="shrink-0" />
         ) : null}
-      </>
+      </Fragment>
     );
     const rowClass =
       "flex items-center gap-2.5 rounded-lg py-2 pl-3 pr-8 text-[13.5px] transition-colors";
@@ -331,7 +334,12 @@ export function SidebarNav({
         }`}
       >
         {locked ? (
-          <Tooltip label={label} description={lockedTooltip} side="right">
+          <Tooltip
+            key={`${href}-destination`}
+            label={label}
+            description={lockedTooltip}
+            side="right"
+          >
             <div
               aria-label={`${label} — ${lockedTooltip}`}
               aria-disabled
@@ -342,9 +350,10 @@ export function SidebarNav({
           </Tooltip>
         ) : (
           <Link
+            key={`${href}-destination`}
             href={href}
             draggable={false}
-            onClick={href === "/home" ? onHomeClick : onNavigate}
+            onClick={href === "/chat" ? onHomeClick : onNavigate}
             className={`${rowClass} ${
               active
                 ? "bg-[var(--accent)] font-medium text-[var(--foreground)]"
@@ -355,6 +364,7 @@ export function SidebarNav({
           </Link>
         )}
         <button
+          key={`${href}-arrange`}
           type="button"
           data-no-drag
           onClick={openRowMenu(href, folded)}
@@ -376,7 +386,9 @@ export function SidebarNav({
   return (
     <nav className="px-2 pt-1">
       <div className="space-y-px">
-        {resolved.visible.map((href) => renderRow(href, visibleDrag, false))}
+        {resolved.visible.map((href) => (
+          <Fragment key={href}>{renderRow(href, visibleDrag, false)}</Fragment>
+        ))}
       </div>
 
       {resolved.collapsed.length > 0 ? (
@@ -442,9 +454,11 @@ export function SidebarNav({
                   moreExpanded ? "opacity-100 delay-[80ms]" : "opacity-0"
                 }`}
               >
-                {resolved.collapsed.map((href) =>
-                  renderRow(href, foldedDrag, true),
-                )}
+                {resolved.collapsed.map((href) => (
+                  <Fragment key={href}>
+                    {renderRow(href, foldedDrag, true)}
+                  </Fragment>
+                ))}
               </div>
             </div>
           </div>
@@ -539,7 +553,7 @@ function RailRow({
     <Tooltip label={label} description={description} side="right">
       <Link
         href={href}
-        onClick={href === "/home" ? onHomeClick : undefined}
+        onClick={href === "/chat" ? onHomeClick : undefined}
         aria-label={label}
         className={`relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-150 ${
           active
