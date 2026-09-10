@@ -49,7 +49,10 @@ import {
   type ReaderHeading,
 } from "@/lib/reading-outline";
 import { cleanQuote } from "@/lib/reading-selection";
-import { MarkdownLine } from "@/lib/reading-inline-markdown";
+import {
+  imageMarkerNames,
+  MarkdownLine,
+} from "@/lib/reading-inline-markdown";
 import { toRecogitoTextAnnotation } from "@/lib/reading-w3c-annotations";
 import type { JumpRequest, SelectionPayload } from "./PdfDocumentView";
 
@@ -240,10 +243,17 @@ export function TextUnitView({
     };
   }, [materialId]);
 
-  const unitMedia = useMemo(
-    () => media.filter((item) => item.locator === locator),
-    [locator, media],
-  );
+  // Pictures whose marker lines the inline renderer does not claim (a marker
+  // embedded mid-paragraph, say) still need the fallback strip below the
+  // article; everything else renders at its original position in the body.
+  // Only this unit's pictures belong here — a picture whose marker lives in
+  // another unit renders inline there.
+  const fallbackMedia = useMemo(() => {
+    const claimed = imageMarkerNames(text);
+    return media.filter(
+      (item) => item.locator === locator && !claimed.has(item.name),
+    );
+  }, [locator, media, text]);
 
   useEffect(() => {
     let cancelled = false;
@@ -645,15 +655,20 @@ export function TextUnitView({
                 variant="prose"
               />
             ) : (
-              <TextWithHeadings text={text} headings={pageHeadings} />
+              <TextWithHeadings
+                text={text}
+                headings={pageHeadings}
+                media={media}
+                materialId={materialId}
+              />
             )}
             </article>
-            {unitMedia.length > 0 && (
+            {fallbackMedia.length > 0 && (
               <div
                 className="mx-auto mt-6 flex flex-col gap-5 pb-4"
                 style={{ maxWidth: `${lineWidth}ch` }}
               >
-                {unitMedia.map((item) => (
+                {fallbackMedia.map((item) => (
                   <figure
                     key={item.name}
                     className="flex flex-col items-center"
@@ -714,13 +729,48 @@ function PreferenceButton({
 function TextWithHeadings({
   text,
   headings,
+  media,
+  materialId,
 }: {
   text: string;
   headings: ReaderHeading[];
+  media: MaterialMediaItem[];
+  materialId: string;
 }) {
   const lines = useMemo(
     () => readerLinesWithHeadings(text, headings),
     [headings, text],
+  );
+
+  // An embedded-picture marker line renders as the picture itself, at the
+  // picture's original position between paragraphs. The marker text stays in
+  // the DOM (HiddenMark pattern, same as every other collapsed marker) so
+  // Recogito's char-level selectors keep resolving against the exact text an
+  // annotation was saved against. A picture whose media row is missing keeps
+  // its literal marker rather than silently vanishing.
+  const renderImage = useCallback(
+    (name: string, markerText: string) => {
+      const item = media.find((row) => row.name === name);
+      if (!item) return null;
+      return (
+        <figure className="my-6 flex flex-col items-center">
+          <span
+            aria-hidden="true"
+            className="inline-block size-0 overflow-hidden align-top text-[0px]"
+          >
+            {markerText}
+          </span>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={materialMediaUrl(materialId, item.name)}
+            alt={item.name}
+            loading="lazy"
+            className="max-h-[70vh] w-auto max-w-full rounded-lg border border-[var(--border)]"
+          />
+        </figure>
+      );
+    },
+    [materialId, media],
   );
 
   return (
@@ -776,7 +826,9 @@ function TextWithHeadings({
             {lineIndex > 0 && "\n"}
             {/* Fenced code stays completely literal — Markdown syntax
                 inside a code block is content, not formatting. */}
-            {line.fence ? line.text : <MarkdownLine text={line.text} />}
+            {line.fence ? line.text : (
+              <MarkdownLine text={line.text} renderImage={renderImage} />
+            )}
           </Fragment>
         );
       })}
