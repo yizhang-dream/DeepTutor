@@ -335,8 +335,12 @@ class TurnExecutor:
             # currently looking at ride along as image attachments, so a
             # vision model sees what the question is about. Pages without
             # images add nothing; pages with them add at most
-            # READING_VIEWPORT_MAX_IMAGES attachments.
-            if capability_name == "immersive_reading":
+            # READING_VIEWPORT_MAX_IMAGES attachments. Keyed on the resolved
+            # workspace mode — the web composer sends capability "chat" with
+            # workspace_mode "immersive_reading", and the mode resolver falls
+            # back to the capability name for direct callers, so both shapes
+            # land here.
+            if workspace_mode == "immersive_reading":
                 attachment_records.extend(
                     _reading_viewport_image_records(
                         _reading_material_id(payload.get("reading_material_id")),
