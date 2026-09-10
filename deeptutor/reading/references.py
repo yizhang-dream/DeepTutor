@@ -17,7 +17,8 @@ from deeptutor.reading.store import MAX_READ_CHARS, ReadingStore
 
 MAX_READING_REFERENCE_MATERIALS = 8
 MAX_READING_REFERENCE_UNITS = 24
-_MATERIAL_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+# Same shape the store accepts: content hashes and catalog-minted rm_ ids.
+_MATERIAL_ID_RE = re.compile(r"^(?:[0-9a-f]{8,64}|rm_[0-9a-f]{12})$")
 
 
 @dataclass(frozen=True, slots=True)

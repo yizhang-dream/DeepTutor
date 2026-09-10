@@ -556,9 +556,11 @@ def _mastery_action_context(
     return "\n\n".join(lines)
 
 
-# Reading material ids are content hashes; anything else is a client bug or an
+# Reading material ids are content hashes or catalog-minted rm_ ids (a second
+# copy of the same content gets its own catalog row, and the store resolves
+# both to the same content directory); anything else is a client bug or an
 # injection attempt, so the shape is enforced here rather than deeper in.
-_READING_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+_READING_ID_RE = re.compile(r"^(?:[0-9a-f]{8,64}|rm_[0-9a-f]{12})$")
 _READING_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # A selection is quoted back into the prompt, so it is bounded here — the
 # reader has no reason to send more, and a runaway selection must not eat the
