@@ -26,6 +26,13 @@ from .types import EmptyParseError, ParsedDocument, ParserError
 
 logger = logging.getLogger(__name__)
 
+# Engines tried, in order, when the active engine does not advertise support
+# for a file's format. markitdown is the pure-Python catch-all (pptx/docx/
+# xlsx/…, no model downloads); the heavier or service-backed engines follow.
+# The first candidate that is installed *and* ready wins, so a deployment
+# without the extras keeps today's skip-with-error behavior.
+_FORMAT_FALLBACK_PREFERENCE = ("markitdown", "docling", "liteparse", "tika")
+
 
 def _matches_supported_format(source_path: str | Path, supported: frozenset[str]) -> bool:
     """Match simple or compound parser suffixes case-insensitively."""
@@ -86,6 +93,13 @@ class ParseService:
         (e.g. local models not downloaded and auto-download disabled) or the
         file type is unsupported.
 
+        If the active engine does not advertise support for the file's format
+        (``pymupdf4llm`` facing a ``.pptx``, say), a format fallback engine is
+        chosen from the installed, ready engines (markitdown first) and the
+        parse proceeds with it; ``parsed.engine`` records the engine that
+        actually produced the content. With no capable engine installed the
+        original unsupported-format error is raised.
+
         If the engine runs but extracts no content — the signature failure of
         a scanned (image-only) PDF under a text-layer extractor — and the
         automatic OCR fallback is enabled (settings key ``ocr_fallback``, on
@@ -98,6 +112,22 @@ class ParseService:
             raise ParserError(f"File to parse not found: {source_path}")
 
         engine_name = (engine or self.active_engine()).strip().lower()
+        if not self.supports(source_path, engine=engine_name):
+            fallback = self._format_fallback_engine(source_path, engine_name)
+            if fallback is not None:
+                logger.info(
+                    "Engine '%s' does not support %s; parsing with '%s' "
+                    "(format fallback)",
+                    engine_name,
+                    source_path.name,
+                    fallback,
+                )
+                if on_output is not None:
+                    on_output(
+                        f"[fallback] '{engine_name}' cannot read {source_path.suffix or 'this format'} "
+                        f"— parsing with '{fallback}'..."
+                    )
+                engine_name = fallback
         try:
             return self._parse_once(source_path, engine_name, on_output)
         except EmptyParseError as exc:
@@ -207,6 +237,31 @@ class ParseService:
         except Exception:
             cache.cleanup_failed(workdir)
             raise
+
+    def _format_fallback_engine(self, source_path: Path, active_engine: str) -> Optional[str]:
+        """Return an installed engine that can read this format, or ``None``.
+
+        Consulted only when the active engine does not advertise support for
+        the file's extension. Candidates are tried in
+        :data:`_FORMAT_FALLBACK_PREFERENCE` order; an engine is skipped when
+        it is the active engine, does not advertise the format, or its
+        dependencies are missing (not ready). Returning ``None`` keeps the
+        original "engine doesn't support this format" error.
+        """
+        for name in _FORMAT_FALLBACK_PREFERENCE:
+            if name == active_engine:
+                continue
+            try:
+                parser = get_parser(name)
+            except ParserError:
+                continue
+            supported = parser.supported_formats()
+            if supported and not _matches_supported_format(source_path, supported):
+                continue
+            if not parser.is_ready(parser.resolve_config()).ready:
+                continue
+            return name
+        return None
 
     def _ocr_fallback_engine(self, source_path: Path, failed_engine: str) -> Optional[str]:
         """Return the engine id to retry an empty parse with, or ``None``.
