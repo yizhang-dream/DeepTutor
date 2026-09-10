@@ -24,7 +24,12 @@ import {
 import { useTranslation } from "react-i18next";
 import RichMarkdownRenderer from "@/components/common/RichMarkdownRenderer";
 import type { AnnotationItem, UnitKind } from "@/lib/reading-api";
-import { getUnitText } from "@/lib/reading-api";
+import {
+  getMaterialMedia,
+  getUnitText,
+  materialMediaUrl,
+  type MaterialMediaItem,
+} from "@/lib/reading-api";
 import {
   DEFAULT_FONT_SIZE,
   DEFAULT_LINE_WIDTH,
@@ -44,7 +49,10 @@ import {
   type ReaderHeading,
 } from "@/lib/reading-outline";
 import { cleanQuote } from "@/lib/reading-selection";
-import { MarkdownLine } from "@/lib/reading-inline-markdown";
+import {
+  imageMarkerNames,
+  MarkdownLine,
+} from "@/lib/reading-inline-markdown";
 import { toRecogitoTextAnnotation } from "@/lib/reading-w3c-annotations";
 import type { JumpRequest, SelectionPayload } from "./PdfDocumentView";
 
@@ -115,6 +123,7 @@ export function TextUnitView({
   } | null>(null);
   const [locator, setLocator] = useState(1);
   const [text, setText] = useState("");
+  const [media, setMedia] = useState<MaterialMediaItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(DEFAULT_FONT_SIZE);
@@ -215,6 +224,36 @@ export function TextUnitView({
   useEffect(() => {
     setLocator(1);
   }, [materialId]);
+
+  // Embedded pictures (DOCX/PPTX ingest), keyed to locators. Materials
+  // without images simply return an empty index; failure keeps the text
+  // readable without the strip.
+  useEffect(() => {
+    let cancelled = false;
+    setMedia([]);
+    getMaterialMedia(materialId)
+      .then((items) => {
+        if (!cancelled) setMedia(items);
+      })
+      .catch(() => {
+        if (!cancelled) setMedia([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [materialId]);
+
+  // Pictures whose marker lines the inline renderer does not claim (a marker
+  // embedded mid-paragraph, say) still need the fallback strip below the
+  // article; everything else renders at its original position in the body.
+  // Only this unit's pictures belong here — a picture whose marker lives in
+  // another unit renders inline there.
+  const fallbackMedia = useMemo(() => {
+    const claimed = imageMarkerNames(text);
+    return media.filter(
+      (item) => item.locator === locator && !claimed.has(item.name),
+    );
+  }, [locator, media, text]);
 
   useEffect(() => {
     let cancelled = false;
@@ -569,6 +608,7 @@ export function TextUnitView({
         ) : error ? (
           <p className="text-[12px] text-[var(--muted-foreground)]">{error}</p>
         ) : (
+          <>
           <article
             ref={articleRef}
             // The sheet. Text used to run edge to edge on the same white as
@@ -615,9 +655,39 @@ export function TextUnitView({
                 variant="prose"
               />
             ) : (
-              <TextWithHeadings text={text} headings={pageHeadings} />
+              <TextWithHeadings
+                text={text}
+                headings={pageHeadings}
+                media={media}
+                materialId={materialId}
+              />
             )}
-          </article>
+            </article>
+            {fallbackMedia.length > 0 && (
+              <div
+                className="mx-auto mt-6 flex flex-col gap-5 pb-4"
+                style={{ maxWidth: `${lineWidth}ch` }}
+              >
+                {fallbackMedia.map((item) => (
+                  <figure
+                    key={item.name}
+                    className="flex flex-col items-center"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={materialMediaUrl(materialId, item.name)}
+                      alt={item.name}
+                      loading="lazy"
+                      className="max-h-[70vh] w-auto max-w-full rounded-lg border border-[var(--border)]"
+                    />
+                    <figcaption className="mt-1.5 text-center font-mono text-[10.5px] text-[var(--muted-foreground)]">
+                      {item.name}
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -659,13 +729,48 @@ function PreferenceButton({
 function TextWithHeadings({
   text,
   headings,
+  media,
+  materialId,
 }: {
   text: string;
   headings: ReaderHeading[];
+  media: MaterialMediaItem[];
+  materialId: string;
 }) {
   const lines = useMemo(
     () => readerLinesWithHeadings(text, headings),
     [headings, text],
+  );
+
+  // An embedded-picture marker line renders as the picture itself, at the
+  // picture's original position between paragraphs. The marker text stays in
+  // the DOM (HiddenMark pattern, same as every other collapsed marker) so
+  // Recogito's char-level selectors keep resolving against the exact text an
+  // annotation was saved against. A picture whose media row is missing keeps
+  // its literal marker rather than silently vanishing.
+  const renderImage = useCallback(
+    (name: string, markerText: string) => {
+      const item = media.find((row) => row.name === name);
+      if (!item) return null;
+      return (
+        <figure className="my-6 flex flex-col items-center">
+          <span
+            aria-hidden="true"
+            className="inline-block size-0 overflow-hidden align-top text-[0px]"
+          >
+            {markerText}
+          </span>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={materialMediaUrl(materialId, item.name)}
+            alt={item.name}
+            loading="lazy"
+            className="max-h-[70vh] w-auto max-w-full rounded-lg border border-[var(--border)]"
+          />
+        </figure>
+      );
+    },
+    [materialId, media],
   );
 
   return (
@@ -721,7 +826,9 @@ function TextWithHeadings({
             {lineIndex > 0 && "\n"}
             {/* Fenced code stays completely literal — Markdown syntax
                 inside a code block is content, not formatting. */}
-            {line.fence ? line.text : <MarkdownLine text={line.text} />}
+            {line.fence ? line.text : (
+              <MarkdownLine text={line.text} renderImage={renderImage} />
+            )}
           </Fragment>
         );
       })}

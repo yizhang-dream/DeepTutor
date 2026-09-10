@@ -2,20 +2,26 @@
 """
 Uvicorn Server Startup Script
 Uses Python API instead of command line to avoid Windows path parsing issues.
+
+This is the hardened backend entry: ``deeptutor start``'s launcher spawns it
+(``python -m deeptutor.api.run_server``) instead of bare ``python -m uvicorn``
+so the Windows ProactorEventLoop fix, SERVER run mode, and logging setup are
+always applied, whatever uvicorn version is installed.
 """
 
-import asyncio
+import argparse
 import os
 from pathlib import Path
 import sys
 
+from deeptutor.runtime.event_loop import ensure_proactor_event_loop
 from deeptutor.runtime.home import get_runtime_home
 
-# Windows: uvicorn defaults to SelectorEventLoop which does not support
-# asyncio.create_subprocess_exec.  Switch to ProactorEventLoop so that
+# Windows: uvicorn can end up on a SelectorEventLoop (reload/workers install
+# their own loop factory; older releases default to selector) which does not
+# support asyncio.create_subprocess_exec.  Switch to ProactorEventLoop so that
 # child-process APIs (used by Math Animator renderer, etc.) work correctly.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+ensure_proactor_event_loop()
 
 import uvicorn
 
@@ -27,10 +33,23 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     # Runtime workspace root owns data/user/settings and generated outputs.
     project_root = get_runtime_home()
     os.chdir(str(project_root))
+
+    parser = argparse.ArgumentParser(
+        prog="python -m deeptutor.api.run_server",
+        description="Start the DeepTutor API server (hardened entry point).",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port number (defaults to the configured backend port).",
+    )
+    args = parser.parse_args(argv)
 
     # Get port from configuration
     from deeptutor.logging import configure_logging
@@ -44,7 +63,9 @@ def main() -> None:
 
     set_mode(RunMode.SERVER)
     configure_logging()
-    backend_port = get_backend_port(project_root)
+    backend_port = (
+        args.port if args.port is not None else get_backend_port(project_root)
+    )
 
     # Configure reload_excludes to skip directories that shouldn't trigger reloads
     # Use absolute paths to ensure they're properly resolved
@@ -79,7 +100,7 @@ def main() -> None:
         )
     uvicorn.run(
         "deeptutor.api.main:app",
-        host="0.0.0.0",
+        host=args.host,
         port=backend_port,
         reload=dev_reload,
         workers=backend_workers,

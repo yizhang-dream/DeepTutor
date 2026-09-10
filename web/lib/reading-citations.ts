@@ -304,8 +304,10 @@ export function citationTargetFromHref(
     return Number.isInteger(locator) && locator >= 1 ? { locator } : null;
   }
   if (!href.startsWith(MATERIAL_LOCATOR_HREF_PREFIX)) return null;
+  // Material ids are content hashes or catalog-minted rm_ ids, matching the
+  // id shape the server-side citation generator can emit.
   const match =
-    /^#dt-material-([0-9a-f]{8,64})(?:-revision-(\d+))?-locator-(\d+)$/i.exec(
+    /^#dt-material-((?:[0-9a-f]{8,64}|rm_[0-9a-f]{12}))(?:-revision-(\d+))?-locator-(\d+)$/i.exec(
       href,
     );
   if (!match) return null;

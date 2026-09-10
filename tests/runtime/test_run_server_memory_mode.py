@@ -31,7 +31,7 @@ def test_run_server_disables_reload_by_default(
 ) -> None:
     monkeypatch.delenv("DEEPTUTOR_DEV_RELOAD", raising=False)
 
-    run_server.main()
+    run_server.main([])
 
     assert uvicorn_kwargs["reload"] is False
     assert uvicorn_kwargs["reload_excludes"] is None
@@ -45,7 +45,7 @@ def test_run_server_reload_remains_available_for_development(
     monkeypatch.setenv("DEEPTUTOR_DEV_RELOAD", "true")
     (tmp_path / "data").mkdir()
 
-    run_server.main()
+    run_server.main([])
 
     assert uvicorn_kwargs["reload"] is True
     assert str(tmp_path / "data") in uvicorn_kwargs["reload_excludes"]

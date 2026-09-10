@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import sys
 
@@ -110,6 +111,23 @@ async def lifespan(app: FastAPI):
     # Execute on startup
     logger.info("Application startup")
     app.state.ready = False
+
+    # Defense in depth (incident 2026-09-08): a backend launched via bare
+    # `python -m uvicorn` can end up on a Windows SelectorEventLoop, which
+    # breaks asyncio child-process APIs and deadlocked the whole API during
+    # KB indexing. Supported entry points (`deeptutor serve`, `deeptutor
+    # start`, deeptutor.api.run_server) pin the Proactor policy; if the loop
+    # is still a selector someone bypassed them — say so loudly.
+    if sys.platform == "win32":
+        running_loop = asyncio.get_running_loop()
+        if not isinstance(running_loop, asyncio.ProactorEventLoop):
+            logger.warning(
+                "Event loop is %s; SelectorEventLoop breaks asyncio subprocess "
+                "APIs and has deadlocked KB indexing. Start the backend via "
+                "`deeptutor serve`, `deeptutor start` (start.bat), or "
+                "deeptutor.api.run_server instead of bare uvicorn.",
+                type(running_loop).__name__,
+            )
 
     # Validate configuration consistency
     validate_tool_consistency()

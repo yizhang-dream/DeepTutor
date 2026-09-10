@@ -238,6 +238,20 @@ class ReadingCapability:
                 )
         return rendered
 
+    @staticmethod
+    def _embedded_image_count(material_id: str, locator: int) -> int:
+        """How many embedded images sit on the locator being viewed.
+
+        Best-effort and silent on failure: the seed must never turn a missing
+        media index into a broken turn.
+        """
+        try:
+            from deeptutor.reading import ReadingStore
+
+            return len(ReadingStore().media_items_at(material_id, locator))
+        except Exception:
+            return 0
+
     # -- tool kwargs ------------------------------------------------------
 
     def augment_kwargs(
@@ -285,6 +299,13 @@ class ReadingCapability:
         parts: list[str] = []
         if locator:
             parts.append(f"The reader is currently showing locator {locator}.")
+            embedded = self._embedded_image_count(resolve_material_id(context), locator)
+            if embedded:
+                parts.append(
+                    f"Locator {locator} contains {embedded} embedded image(s) from the document; "
+                    "they are attached to this message, so read them directly when the question "
+                    "concerns a figure."
+                )
         time_seconds = _as_float(viewport.get("time_seconds"))
         if time_seconds >= 0 and "time_seconds" in viewport:
             parts.append(f"Current media time: {_timestamp(time_seconds)} ({time_seconds:.1f}s).")

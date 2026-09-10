@@ -34,6 +34,13 @@ from pathlib import Path
 import re
 
 from deeptutor.reading.models import OutlineEntry, ReadingError, RenderMode, UnitKind, UnitReference
+from deeptutor.services.parsing.text_quality import has_meaningful_text
+from deeptutor.utils.document_images import (
+    EmbeddedImage,
+    extract_docx_rich,
+    extract_pptx_rich,
+    find_markers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,16 @@ RAW_VIEW_EXTENSIONS = frozenset({".pdf"})
 
 
 @dataclass(frozen=True, slots=True)
+class MediaItem:
+    """One embedded image pinned to the locator whose text references it."""
+
+    name: str
+    mime_type: str
+    data: bytes
+    locator: int
+
+
+@dataclass(frozen=True, slots=True)
 class Extraction:
     """The result of cutting one source file into units."""
 
@@ -71,10 +88,40 @@ class Extraction:
     outline: tuple[OutlineEntry, ...] = field(default_factory=tuple)
     render_mode: RenderMode = "text"
     unit_refs: tuple[UnitReference, ...] = field(default_factory=tuple)
+    # Embedded pictures (DOCX/PPTX) mapped to the unit that mentions them.
+    media: tuple[MediaItem, ...] = field(default_factory=tuple)
 
     @property
     def char_count(self) -> int:
         return sum(len(u) for u in self.units)
+
+
+def _media_for_units(
+    units: tuple[str, ...], images: tuple[EmbeddedImage, ...]
+) -> tuple[MediaItem, ...]:
+    """Map ``[图片 N]`` markers in unit texts to their image bytes.
+
+    A marker names the image it belongs to, so the mapping needs no position
+    bookkeeping: scan each unit, look the name up, and pin the image to that
+    locator. Repeated markers (the same figure floated into two sections) are
+    kept once per locator; unknown names are skipped silently — the text still
+    stands on its own.
+    """
+    by_name = {image.name: image for image in images}
+    if not by_name:
+        return ()
+    items: list[MediaItem] = []
+    seen: set[tuple[int, str]] = set()
+    for locator, unit in enumerate(units, start=1):
+        for _, name in find_markers(unit):
+            image = by_name.get(name)
+            if image is None or (locator, name) in seen:
+                continue
+            seen.add((locator, name))
+            items.append(
+                MediaItem(name=name, mime_type=image.mime_type, data=image.data, locator=locator)
+            )
+    return tuple(items)
 
 
 def extract_material(path: str | Path) -> Extraction:
@@ -129,15 +176,97 @@ def _extract_pdf(source: Path) -> Extraction:
     except Exception as exc:
         raise ReadingError(f"{source.name}: failed to read PDF ({exc})") from exc
 
+    extractor = "pymupdf"
+    # Figure-label text objects on scanned pages defeat a bare strip() check
+    # (a few dozen alphanumerics per page) while carrying no readable prose —
+    # judge density so such scans still reach the OCR fallback.
+    if not has_meaningful_text("\n".join(units), page_count=len(units)):
+        ocr_units = _ocr_pdf_units(source, page_count=len(units))
+        if ocr_units is not None:
+            units = ocr_units
+            extractor = "mineru-ocr"
+
     return Extraction(
         units=units,
         unit="page",
-        extractor="pymupdf",
+        extractor=extractor,
         has_raw_view=True,
         title=title,
         outline=outline,
         render_mode="pdf",
     )
+
+
+def _ocr_pdf_units(source: Path, *, page_count: int) -> tuple[str, ...] | None:
+    """Re-extract an image-only PDF through the MinerU parse engine (OCR).
+
+    Returns page-aligned unit texts so locators keep matching the raw PDF
+    view, or ``None`` when the fallback cannot help (disabled in settings,
+    MinerU not ready, OCR itself failed) — in which case the caller keeps the
+    empty extraction and ``extract_material`` raises the standard
+    "scanned document needs OCR" error.
+    """
+    from deeptutor.services.config.runtime_settings import load_document_parsing_settings
+    from deeptutor.services.parsing import get_parse_service
+
+    if not load_document_parsing_settings().get("ocr_fallback", True):
+        return None
+
+    logger.info("%s: no text layer, trying MinerU OCR fallback", source.name)
+    try:
+        parsed = get_parse_service().parse(source, engine="mineru")
+    except Exception as exc:
+        logger.warning("%s: MinerU OCR fallback failed: %s", source.name, exc)
+        return None
+
+    pieces: list[str] = [""] * page_count
+    degraded_orphans = 0
+    for block in parsed.blocks or []:
+        text = _ocr_block_text(block)
+        if not text:
+            continue
+        try:
+            page_idx = int(block.get("page_idx", -1))
+        except (TypeError, ValueError):
+            page_idx = -1
+        if 0 <= page_idx < page_count:
+            pieces[page_idx] = f"{pieces[page_idx]}\n\n{text}".strip()
+        else:
+            degraded_orphans += 1
+
+    if any(piece.strip() for piece in pieces):
+        if degraded_orphans:
+            logger.debug(
+                "%s: %d OCR blocks outside the page range dropped", source.name, degraded_orphans
+            )
+        return tuple(pieces)
+
+    # Structure without usable page indices (defensive): keep the text as a
+    # single unit rather than losing it; locators degrade to one page.
+    markdown = (parsed.markdown or "").strip()
+    if markdown:
+        logger.warning(
+            "%s: OCR blocks carried no page indices; emitting one combined unit",
+            source.name,
+        )
+        return (markdown,)
+    return None
+
+
+def _ocr_block_text(block: dict) -> str:
+    """Flatten one MinerU content_list block into readable text."""
+    parts: list[str] = []
+    for key in ("text", "equation_text", "table_body"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    for key in ("img_caption", "img_footnote", "table_caption"):
+        value = block.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+    return "\n".join(parts)
 
 
 def _extract_epub(source: Path) -> Extraction:
@@ -208,14 +337,43 @@ def _pdf_outline(doc: object, *, page_count: int) -> tuple[OutlineEntry, ...]:
 
 
 def _extract_slides(source: Path) -> Extraction:
-    text = _shared_extract(source)
+    text, images = _slides_text_and_images(source)
     parts = [part.strip() for part in _SLIDE_SEPARATOR.split(text)]
     units = tuple(part for part in parts if part)
     if not units:
         # The extractor found text but no slide separators (legacy .ppt via the
         # raw-OOXML fallback). Treat it as flat text rather than losing it.
         return _sections_from_text(text, extractor="pptx-text")
-    return Extraction(units=units, unit="slide", extractor="pptx")
+    return Extraction(
+        units=units,
+        unit="slide",
+        extractor="pptx",
+        media=_media_for_units(units, images),
+    )
+
+
+def _slides_text_and_images(source: Path) -> tuple[str, tuple[EmbeddedImage, ...]]:
+    """Slide text with image markers, preferring the rich extraction.
+
+    Falls back to the shared extractor (text only) when the rich path cannot
+    read the deck, so ingest never fails on a picture quirk.
+    """
+    try:
+        rich = extract_pptx_rich(source.read_bytes())
+    except Exception:
+        rich = None
+    if rich is not None and any(slide.strip() for slide in rich.slides):
+        parts = [
+            f"--- Slide {index} ---\n{slide}".rstrip()
+            for index, slide in enumerate(rich.slides, 1)
+            if slide.strip()
+        ]
+        text = "\n\n".join(parts)
+        note = rich.collection.summary_note()
+        if note:
+            text += f"\n\n{note}"
+        return text, rich.collection.images
+    return _shared_extract(source), ()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +382,30 @@ def _extract_slides(source: Path) -> Extraction:
 
 
 def _extract_sections(source: Path) -> Extraction:
+    """Flat-text formats, cut into sections on paragraph boundaries.
+
+    DOCX goes through the rich extraction first so embedded images survive
+    with their section mapping; every other format (and a failed rich parse)
+    uses the shared text-only extractor.
+    """
+    images: tuple[EmbeddedImage, ...] = ()
+    if source.suffix.lower() == ".docx":
+        try:
+            rich = extract_docx_rich(source.read_bytes())
+        except Exception:
+            rich = None
+        if rich is not None and any(paragraph.strip() for paragraph in rich.paragraphs):
+            text = "\n\n".join(rich.paragraphs)
+            note = rich.collection.summary_note()
+            if note:
+                text += f"\n\n{note}"
+            units = split_into_sections(text)
+            return Extraction(
+                units=units,
+                unit="section",
+                extractor="docx",
+                media=_media_for_units(units, rich.collection.images),
+            )
     return _sections_from_text(_shared_extract(source), extractor="text")
 
 

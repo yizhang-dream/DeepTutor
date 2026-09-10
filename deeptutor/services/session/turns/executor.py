@@ -41,6 +41,7 @@ from .._turn_runtime_shared import (
     _reading_material_revision,
     _reading_references,
     _reading_viewport,
+    _reading_viewport_image_records,
     _reading_workspace_id,
     _repair_chinese_emphasis_for_persistence,
     _request_snapshot_metadata,
@@ -329,6 +330,55 @@ class TurnExecutor:
             from deeptutor.utils.document_extractor import extract_documents_from_records
 
             document_texts, attachment_records = extract_documents_from_records(attachment_records)
+
+            # Immersive reading: the embedded figures on the page the user is
+            # currently looking at ride along as image attachments, so a
+            # vision model sees what the question is about. Pages without
+            # images add nothing; pages with them add at most
+            # READING_VIEWPORT_MAX_IMAGES attachments. Keyed on the resolved
+            # workspace mode — the web composer sends capability "chat" with
+            # workspace_mode "immersive_reading", and the mode resolver falls
+            # back to the capability name for direct callers, so both shapes
+            # land here.
+            if workspace_mode == "immersive_reading":
+                attachment_records.extend(
+                    _reading_viewport_image_records(
+                        _reading_material_id(payload.get("reading_material_id")),
+                        _reading_viewport(payload.get("reading_viewport")),
+                    )
+                )
+
+            # Embedded images harvested out of office documents during
+            # extraction arrive with base64 and no URL — host them too so
+            # message previews survive the base64 pruning below and the
+            # reader pane can display them.
+            for record in attachment_records:
+                if record.get("url") or not record.get("base64"):
+                    continue
+                try:
+                    raw_bytes = _b64.b64decode(record["base64"], validate=False)
+                except Exception as exc:
+                    logger.warning(
+                        "skipping embedded-image upload for %r: invalid base64 (%s)",
+                        record.get("filename"),
+                        exc,
+                    )
+                    continue
+                try:
+                    record["url"] = await attachment_store.put(
+                        session_id=session_id,
+                        attachment_id=record.get("id") or _uuid.uuid4().hex[:12],
+                        filename=record.get("filename", "") or "image",
+                        data=raw_bytes,
+                        mime_type=record.get("mime_type", "") or "",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "attachment store rejected embedded image %r: %s",
+                        record.get("filename"),
+                        exc,
+                    )
+
             attachments = [
                 Attachment(
                     type=r.get("type", "file"),

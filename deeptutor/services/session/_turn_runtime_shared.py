@@ -556,9 +556,11 @@ def _mastery_action_context(
     return "\n\n".join(lines)
 
 
-# Reading material ids are content hashes; anything else is a client bug or an
+# Reading material ids are content hashes or catalog-minted rm_ ids (a second
+# copy of the same content gets its own catalog row, and the store resolves
+# both to the same content directory); anything else is a client bug or an
 # injection attempt, so the shape is enforced here rather than deeper in.
-_READING_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+_READING_ID_RE = re.compile(r"^(?:[0-9a-f]{8,64}|rm_[0-9a-f]{12})$")
 _READING_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # A selection is quoted back into the prompt, so it is bounded here — the
 # reader has no reason to send more, and a runaway selection must not eat the
@@ -609,6 +611,47 @@ def _reading_viewport(value: Any) -> dict[str, Any]:
     if selection:
         viewport["selection"] = selection[:READING_SELECTION_MAX_CHARS]
     return viewport
+
+
+# Images attached per reading turn when the open page has embedded figures.
+READING_VIEWPORT_MAX_IMAGES = 4
+
+
+def _reading_viewport_image_records(material_id: str, viewport: dict[str, Any]) -> list[dict]:
+    """Image attachment records for the figures on the currently open page."""
+    try:
+        locator = int(viewport.get("locator") or 0)
+    except (TypeError, ValueError):
+        locator = 0
+    if not material_id or locator <= 0:
+        return []
+    try:
+        import base64
+
+        from deeptutor.reading import ReadingStore
+
+        store = ReadingStore()
+        rows = store.media_items_at(material_id, locator)
+        records: list[dict] = []
+        for index, row in enumerate(rows[:READING_VIEWPORT_MAX_IMAGES], start=1):
+            path = store.media_path(material_id, str(row.get("name") or ""))
+            if path is None:
+                continue
+            records.append(
+                {
+                    "type": "image",
+                    "url": "",
+                    "base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "filename": str(row.get("name") or f"image-{index}.png"),
+                    "mime_type": str(row.get("mime") or "image/png"),
+                    "id": f"rv-{material_id[:12]}-{locator}-{index}",
+                    "embedded": True,
+                }
+            )
+        return records
+    except Exception:
+        logger.warning("reading viewport image lookup failed", exc_info=True)
+        return []
 
 
 def _course_field(value: Any, key: str, default: Any = "") -> Any:

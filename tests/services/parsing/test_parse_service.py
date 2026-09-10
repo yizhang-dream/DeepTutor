@@ -148,3 +148,111 @@ def test_missing_file_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     service = ParseService(cache_root=tmp_path / "cache")
     with pytest.raises(ParserError):
         service.parse(tmp_path / "ghost.pdf", engine="fake")
+
+
+# ---------------------------------------------------------------------------
+# Empty-result → MinerU OCR fallback
+# ---------------------------------------------------------------------------
+
+
+class _EmptyParser(_FakeParser):
+    """An engine that runs but extracts nothing (scanned PDF, no text layer)."""
+
+    def parse(self, source_path: Path, workdir: Path, *, config, on_output=None) -> None:
+        self.calls.append(source_path)
+        (workdir / f"{source_path.stem}.md").write_text("", encoding="utf-8")
+
+
+class _OcrParser(_FakeParser):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.name = "mineru"
+
+    def signature(self, _config):
+        return signature.ParserSignature.build("mineru", "1", {"v": self._sig})
+
+    def parse(self, source_path: Path, workdir: Path, *, config, on_output=None) -> None:
+        self.calls.append(source_path)
+        (workdir / f"{source_path.stem}.md").write_text("# OCR'd text", encoding="utf-8")
+
+
+def _use_map(monkeypatch, parsers: dict) -> None:
+    monkeypatch.setattr(svc_mod, "get_parser", lambda name: parsers[name])
+
+
+def test_empty_parse_falls_back_to_mineru(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, ocr = _EmptyParser(), _OcrParser()
+    _use_map(monkeypatch, {"pymupdf4llm": primary, "mineru": ocr})
+    monkeypatch.setattr(
+        svc_mod, "load_document_parsing_settings", lambda: {"ocr_fallback": True}
+    )
+    service = ParseService(cache_root=tmp_path / "cache")
+
+    parsed = service.parse(_pdf(tmp_path), engine="pymupdf4llm")
+
+    assert parsed.engine == "mineru"
+    assert parsed.markdown == "# OCR'd text"
+    assert len(primary.calls) == 1 and len(ocr.calls) == 1
+
+
+def test_ocr_fallback_disabled_keeps_empty_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, ocr = _EmptyParser(), _OcrParser()
+    _use_map(monkeypatch, {"pymupdf4llm": primary, "mineru": ocr})
+    monkeypatch.setattr(
+        svc_mod, "load_document_parsing_settings", lambda: {"ocr_fallback": False}
+    )
+    service = ParseService(cache_root=tmp_path / "cache")
+
+    with pytest.raises(ParserError, match="produced no content"):
+        service.parse(_pdf(tmp_path), engine="pymupdf4llm")
+    assert ocr.calls == []
+
+
+def test_fallback_also_empty_raises_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_map(monkeypatch, {"mineru": _EmptyParser()})
+    monkeypatch.setattr(
+        svc_mod, "load_document_parsing_settings", lambda: {"ocr_fallback": True}
+    )
+    service = ParseService(cache_root=tmp_path / "cache")
+
+    with pytest.raises(ParserError, match="The 'mineru' engine produced no content"):
+        service.parse(_pdf(tmp_path), engine="mineru")
+
+
+def test_fallback_skipped_when_mineru_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, ocr = _EmptyParser(), _OcrParser(ready=False)
+    _use_map(monkeypatch, {"pymupdf4llm": primary, "mineru": ocr})
+    monkeypatch.setattr(
+        svc_mod, "load_document_parsing_settings", lambda: {"ocr_fallback": True}
+    )
+    service = ParseService(cache_root=tmp_path / "cache")
+
+    with pytest.raises(ParserError, match="produced no content"):
+        service.parse(_pdf(tmp_path), engine="pymupdf4llm")
+    assert ocr.calls == []
+
+
+def test_fallback_streams_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_map(monkeypatch, {"pymupdf4llm": _EmptyParser(), "mineru": _OcrParser()})
+    monkeypatch.setattr(
+        svc_mod, "load_document_parsing_settings", lambda: {"ocr_fallback": True}
+    )
+    lines: list[str] = []
+
+    def _sink(line: str) -> None:
+        lines.append(line)
+
+    ParseService(cache_root=tmp_path / "cache").parse(
+        _pdf(tmp_path), engine="pymupdf4llm", on_output=_sink
+    )
+    assert any("fallback" in line and "mineru" in line for line in lines)

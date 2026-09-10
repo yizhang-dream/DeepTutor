@@ -207,6 +207,9 @@ class MaterialManifest:
     # Selects the faithful renderer without overloading ``has_raw_view``.
     # The legacy boolean remains PDF-only until every client understands EPUB.
     render_mode: RenderMode = "text"
+    # Embedded images stored under ``media/`` (DOCX/PPTX today; PDFs render
+    # their own images in the raw view). Zero for older materials.
+    media_count: int = 0
     # Uploaded Markdown remains literal source text; only captured web pages
     # opt into structured rendering.
     content_format: ContentFormat = "plain_text"
@@ -229,6 +232,7 @@ class MaterialManifest:
             "created_at": self.created_at,
             "has_raw_view": self.has_raw_view,
             "render_mode": self.render_mode,
+            "media_count": self.media_count,
             "content_format": self.content_format,
             "source_type": self.source_type,
             "source_url": self.source_url,
@@ -258,6 +262,7 @@ class MaterialManifest:
             created_at=float(data.get("created_at") or 0.0),
             has_raw_view=bool(data.get("has_raw_view")),
             render_mode=render_mode,  # type: ignore[arg-type]
+            media_count=int(data.get("media_count") or 0),
             content_format=content_format,  # type: ignore[arg-type]
             source_type=str(data.get("source_type") or "upload"),
             source_url=str(data.get("source_url") or ""),

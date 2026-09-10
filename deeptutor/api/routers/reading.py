@@ -21,12 +21,13 @@ import logging
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 from typing import Any, Literal
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, UploadFile
 from fastapi.params import File
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
 from deeptutor.multi_user.learning_access import (
@@ -64,6 +65,10 @@ from deeptutor.utils.document_validator import DocumentValidator
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Serializes background (async=true) ingests: concurrent document parses would
+# otherwise race inside the store/catalog for the same cache directories.
+_INGEST_LOCK = threading.Lock()
 
 # Streaming upload ceiling. Same number the extractor enforces, so a file that
 # passes here cannot then be rejected deeper in with a less helpful message.
@@ -915,6 +920,7 @@ async def upload_material(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),  # noqa: B008
     reuse: bool = Query(default=True),
+    async_mode: bool = Query(default=False, alias="async"),
 ) -> MaterialDetail:
     """Ingest an uploaded document and return it ready to read.
 
@@ -926,6 +932,12 @@ async def upload_material(
     length of a lecture meant no progress could reach the client, the browser
     or a proxy could time the upload out after the transcription had already
     been paid for, and nothing was left on disk to retry from.
+
+    Regular documents parse inline, so scanned PDFs (which fall back to a
+    minutes-long OCR run) can outlive HTTP-level client timeouts. Pass
+    ``async=true`` to get a ``202 {"status": "processing"}`` immediately and
+    let the ingest run as a background task; poll ``GET /materials`` until the
+    file shows up.
     """
     try:
         assert_learning_material("", upload=True)
@@ -960,6 +972,29 @@ async def upload_material(
             record = await service.queue_media(tmp_path, filename=filename)
             background_tasks.add_task(service.process_media, record.material_id)
             return _detail(store, store.manifest(record.material_id))
+        elif async_mode:
+            # Move the validated upload somewhere that outlives this request
+            # (the finally below removes tmp_dir) and ingest off-request.
+            staging_dir = Path(tempfile.mkdtemp(prefix="dt-reading-async-"))
+            staged = staging_dir / tmp_path.name
+            tmp_path.replace(staged)
+
+            def _ingest_background() -> None:
+                try:
+                    with _INGEST_LOCK:
+                        manifest = store.ingest(staged, filename=filename)
+                        if _catalog().get_material(manifest.material_id) is None:
+                            _catalog().register_manifest(manifest)
+                except Exception:
+                    logger.exception("Async reading ingest failed for %s", filename)
+                finally:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+            background_tasks.add_task(_ingest_background)
+            return JSONResponse(
+                status_code=202,
+                content={"status": "processing", "filename": filename},
+            )
         else:
             manifest = store.ingest(tmp_path, filename=filename)
             catalog = _catalog()
@@ -1186,6 +1221,42 @@ async def get_raw(material_id: str) -> FileResponse:
         media_type=manifest.mime or "application/octet-stream",
         filename=manifest.filename,
         content_disposition_type="inline",
+    )
+
+
+@router.get("/materials/{material_id}/media")
+async def list_material_media(material_id: str) -> list[dict[str, Any]]:
+    """The embedded-image index (name / locator / mime / size), empty if none."""
+    store = _store()
+    try:
+        return store.media_items(material_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/materials/{material_id}/media/{name}")
+async def get_material_media(material_id: str, name: str) -> FileResponse:
+    """One embedded image's bytes, for the reader pane's media strip."""
+    store = _store()
+    try:
+        path = store.media_path(material_id, name)
+        mime = next(
+            (row.get("mime") for row in store.media_items(material_id) if row.get("name") == name),
+            "",
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+    if path is None:
+        raise HTTPException(status_code=404, detail="No such image in this material.")
+    return FileResponse(
+        path,
+        media_type=mime or "image/png",
+        filename=name,
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
