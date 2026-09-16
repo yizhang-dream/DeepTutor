@@ -304,6 +304,32 @@ test("row spacing: \\\\[2pt] is not treated as a display-math delimiter", () => 
 });
 
 // ---------------------------------------------------------------------------
+// convertLatexDelimiters — bare formulas and unclosed display blocks
+// (model output that used to stay literal text)
+// ---------------------------------------------------------------------------
+
+test("bare math: a formula written without delimiters is wrapped", () => {
+  assert.equal(hasMarkdownMath("所以 P_t = 1 成立"), true);
+  assert.equal(convertLatexDelimiters("所以 P_t = 1 成立"), "所以 $P_t = 1$ 成立");
+  assert.equal(convertLatexDelimiters("∫₀^∞ u²e^(−u)du"), "$∫₀^∞ u²e^{−u}du$");
+  assert.ok(processMarkdownContent("所以 P_t = 1").includes("$P_t = 1$"));
+});
+
+test("bare math: fenced code keeps bare-looking formulas verbatim", () => {
+  const input = "```\nP_t = 1\n```";
+  assert.equal(convertLatexDelimiters(input), input);
+});
+
+test("display math: an unclosed $$ block is closed at the end of the segment", () => {
+  assert.equal(convertLatexDelimiters("$$\\frac{a}{b}"), "$$\\frac{a}{b}\n$$");
+  assert.equal(
+    convertLatexDelimiters("推导：\n$$\n\\frac{a}{b}"),
+    "推导：\n$$\n\\frac{a}{b}\n$$",
+  );
+  assert.equal(convertLatexDelimiters("$$x$$ text"), "$$x$$ text");
+});
+
+// ---------------------------------------------------------------------------
 // processLatexContent (thin wrapper)
 // ---------------------------------------------------------------------------
 

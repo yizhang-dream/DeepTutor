@@ -6,6 +6,11 @@
  * This utility converts between formats.
  */
 
+import {
+  hasBareMathSeed,
+  hasOpenDisplayMath,
+  wrapBareMathRuns,
+} from "./bare-math";
 import { normalizeAtxHeadings } from "./markdown-display";
 
 // A single-dollar math span must be tight at both ends. This mirrors the
@@ -57,8 +62,10 @@ const BARE_MATH_ENVIRONMENT_RE = new RegExp(
  * Display-math and backslash delimiters are detected from their opening token
  * so streaming content switches to the rich renderer as early as possible.
  * Single-dollar math waits for a valid closing delimiter because a lone `$`
- * is common in currency. Once a match exists, appending streamed text cannot
- * make it disappear, so the Simple -> Rich transition remains one-way.
+ * is common in currency. Bare formulas without any delimiter (`P_t`, `∫₀^∞`)
+ * are detected through their seed tokens. Once a match exists, appending
+ * streamed text cannot make it disappear, so the Simple -> Rich transition
+ * remains one-way.
  */
 export function hasMarkdownMath(content: string): boolean {
   if (!content) return false;
@@ -67,6 +74,7 @@ export function hasMarkdownMath(content: string): boolean {
   if (/(^|[^\\])\$\$/.test(value)) return true;
   if (/\\\(|\\\[/.test(value)) return true;
   if (BARE_MATH_ENVIRONMENT_RE.test(value)) return true;
+  if (hasBareMathSeed(value)) return true;
   return INLINE_MARKDOWN_MATH_RE.test(value);
 }
 
@@ -220,9 +228,20 @@ function convertLatexSegment(text: string): string {
   // Environments already sitting inside a $$ block are left alone.
   result = wrapBareMathEnvironments(result);
 
+  // Formulas the model wrote without any delimiter (`P_t`, `∫₀^∞ u²e^(−u)du`)
+  // would otherwise stay literal text; `$`-delimited regions are left alone.
+  result = wrapBareMathRuns(result);
+
   // Inside a GFM table row an unescaped `|` splits the row even within math,
   // so swap the pipes of inline formulas for the same-glyph `\vert{}`.
   result = protectInlineMathPipesInTables(result);
+
+  // A display block the model never closed (`$$\frac{a}{b}` right up to the end
+  // of the message) makes remark-math treat everything after it as text. Only a
+  // `$$` that opens its line starts display math, so a stray mid-line `$$` does
+  // not make every later line "unclosed"; the repair is state free, so a real
+  // closing token cancels it.
+  if (hasOpenDisplayMath(result)) result += "\n$$";
 
   return result;
 }
