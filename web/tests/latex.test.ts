@@ -82,6 +82,228 @@ test("convertLatexDelimiters: collapses triple+ newlines", () => {
 });
 
 // ---------------------------------------------------------------------------
+// convertLatexDelimiters — doubled backslashes, bare environments, fences,
+// table rows (model output the renderer used to drop)
+// ---------------------------------------------------------------------------
+
+test("escaped delimiters: \\\\(x = 1\\\\) → $x = 1$ with no leftover backslash", () => {
+  const input = "\\\\(x = 1\\\\)";
+  assert.equal(hasMarkdownMath(input), true);
+
+  const result = convertLatexDelimiters(input);
+  assert.ok(result.includes("$x = 1$"));
+  assert.ok(!result.includes("\\ $"), "no dangling backslash before the span");
+  assert.ok(!result.includes("\\\\"), "the doubled backslashes are normalised");
+});
+
+test("escaped delimiters: \\\\[x = 1\\\\] → block $$...$$", () => {
+  const result = convertLatexDelimiters("\\\\[x = 1\\\\]");
+  assert.ok(result.includes("$$\nx = 1\n$$"));
+});
+
+test("escaped delimiters: a doubled environment is unwrapped, then wrapped in $$", () => {
+  const input = "\\\\begin{equation} E=mc^2 \\\\end{equation}";
+  assert.equal(hasMarkdownMath(input), true);
+
+  const result = convertLatexDelimiters(input);
+  assert.equal(
+    result,
+    "$$\n\\begin{equation} E=mc^2 \\end{equation}\n$$",
+    "tags are single-backslash inside the block",
+  );
+  assert.ok(!result.includes("\\\\"), "no orphan backslash in the math block");
+});
+
+test("escaped delimiters: a \\\\ line break inside $$ aligned is left alone", () => {
+  const input = "$$\\begin{aligned} a \\\\ b \\end{aligned}$$";
+  const result = convertLatexDelimiters(input);
+
+  assert.equal(result, input);
+  assert.ok(result.includes("\\\\"), "the \\\\ line break survives");
+});
+
+test("escaped delimiters: a line break before inline math is not mis-split", () => {
+  // Raw text: `a \\\(x\) b` — a two-backslash line break immediately followed
+  // by the `\(` opener. Only the opener's own backslash may be consumed.
+  const lineBreak = "\\\\"; // the two characters `\` `\`
+  const input = `a ${lineBreak}\\(x\\) b`;
+  const result = convertLatexDelimiters(input);
+
+  assert.ok(result.includes("a \\\\ $x$"), "the \\\\ line break stays a pair");
+  assert.ok(result.includes("$x$"), "the inline formula still converts");
+  assert.equal(
+    (result.match(/\\/g) ?? []).length,
+    2,
+    "no stray backslash is left behind",
+  );
+});
+
+test("escaped delimiters: a line break before a nested environment survives", () => {
+  // `\\` (line break) immediately followed by `\begin{...}`: the first two
+  // backslashes belong to the break, not to a doubled environment tag.
+  const input = "x \\\\\\begin{cases} y \\end{cases}";
+  const result = convertLatexDelimiters(input);
+
+  assert.equal(result, input);
+  assert.ok(
+    result.includes("\\\\\\begin{cases}"),
+    "break and opener stay intact",
+  );
+});
+
+test("bare environment: \\begin{equation} is detected and wrapped in $$", () => {
+  const input = "\\begin{equation} E=mc^2 \\end{equation}";
+  assert.equal(hasMarkdownMath(input), true);
+
+  const result = convertLatexDelimiters(input);
+  assert.ok(result.includes("$$\n\\begin{equation} E=mc^2 \\end{equation}\n$$"));
+});
+
+test("bare environment: starred align keeps its \\\\ line breaks", () => {
+  const input = "\\begin{align*} a&=b \\\\ c&=d \\end{align*}";
+  assert.equal(hasMarkdownMath(input), true);
+
+  const result = convertLatexDelimiters(input);
+  assert.ok(
+    result.includes("$$\n\\begin{align*} a&=b \\\\ c&=d \\end{align*}\n$$"),
+  );
+  assert.ok(result.includes("\\\\"), "internal \\\\ line break must survive");
+});
+
+test("bare environment: an environment already inside $$ is not wrapped twice", () => {
+  const inline = "$$\\begin{aligned} a&=b \\end{aligned}$$";
+  assert.equal(convertLatexDelimiters(inline), inline);
+
+  const block = "$$\n\\begin{aligned}\na&=b\n\\end{aligned}\n$$";
+  assert.equal(convertLatexDelimiters(block), block);
+});
+
+test("bare environment: a $-wrapped one-liner keeps its delimiters", () => {
+  const input = "$\\begin{aligned} a&=b \\end{aligned}$";
+  assert.equal(convertLatexDelimiters(input), input);
+});
+
+test("bare environment: after an inline formula on the previous line it is wrapped", () => {
+  const input = "结论是 $x=2$\n\\begin{equation} E \\end{equation}";
+  assert.equal(
+    convertLatexDelimiters(input),
+    "结论是 $x=2$\n$$\n\\begin{equation} E \\end{equation}\n$$",
+  );
+});
+
+test("bare environment: after a closed $$ block it is wrapped", () => {
+  const input = "$$\na\n$$\n\\begin{equation} E \\end{equation}";
+  assert.equal(
+    convertLatexDelimiters(input),
+    "$$\na\n$$\n$$\n\\begin{equation} E \\end{equation}\n$$",
+  );
+});
+
+test("bare environment: only KaTeX-renderable environments are wrapped", () => {
+  for (const bare of [
+    "\\begin{equation} a \\end{equation}",
+    "\\begin{align} a \\end{align}",
+    "\\begin{alignat}{2} a \\end{alignat}",
+    "\\begin{gather} a \\end{gather}",
+    "\\begin{aligned} a \\end{aligned}",
+    "\\begin{gathered} a \\end{gathered}",
+  ]) {
+    assert.ok(
+      convertLatexDelimiters(bare).includes("$$"),
+      `${bare} should be wrapped`,
+    );
+  }
+
+  for (const env of ["multline", "eqnarray", "flalign", "math", "displaymath"]) {
+    const bare = `\\begin{${env}} a \\end{${env}}`;
+    assert.equal(hasMarkdownMath(bare), true, `${env} still needs the rich renderer`);
+    assert.equal(convertLatexDelimiters(bare), bare, `${env} is left unwrapped`);
+  }
+
+  // `aligned*`/`gathered*` do not exist in KaTeX, so they are not wrappable.
+  const starredInner = "\\begin{aligned*} a \\end{aligned*}";
+  assert.equal(convertLatexDelimiters(starredInner), starredInner);
+});
+
+test("bare environment: alignat without its column count is left alone", () => {
+  for (const env of ["alignat", "alignat*"]) {
+    const bare = `\\begin{${env}} a &= b \\end{${env}}`;
+
+    assert.equal(hasMarkdownMath(bare), true, `${env} still needs the rich renderer`);
+    assert.equal(convertLatexDelimiters(bare), bare, `${env} is left unwrapped`);
+  }
+});
+
+test("bare environment: alignat with its column count is wrapped", () => {
+  for (const env of ["alignat", "alignat*"]) {
+    const input = `\\begin{${env}}{2} a &= b \\end{${env}}`;
+
+    assert.equal(convertLatexDelimiters(input), `$$\n${input}\n$$`);
+  }
+});
+
+test("fences: LaTeX inside ``` / ~~~ blocks is copied through untouched", () => {
+  const fencedEnv = "```latex\n\\begin{equation}x\\end{equation}\n```";
+  assert.equal(convertLatexDelimiters(fencedEnv), fencedEnv);
+
+  const fencedInline = "```text\n\\\\(x\\\\)\n```";
+  assert.equal(convertLatexDelimiters(fencedInline), fencedInline);
+
+  const fencedTilde = "~~~\n\\\\(y\\\\)\n~~~";
+  assert.equal(convertLatexDelimiters(fencedTilde), fencedTilde);
+
+  const unclosed = "```text\n\\\\(x\\\\)";
+  assert.equal(convertLatexDelimiters(unclosed), unclosed);
+});
+
+test("fences: prose around a fenced block is still converted", () => {
+  const input = "```\n\\\\(x\\\\)\n```\n\nSolve \\\\(y = 2\\\\) now";
+  const result = convertLatexDelimiters(input);
+
+  assert.ok(result.includes("```\n\\\\(x\\\\)\n```"), "fence body stays verbatim");
+  assert.ok(result.includes("$y = 2$"), "prose after the fence is converted");
+});
+
+test("tables: unescaped pipes inside row math become \\vert", () => {
+  const input = "| 定义 | $|x|=2$ |";
+  const result = convertLatexDelimiters(input);
+
+  assert.ok(result.includes("$\\vert{}x\\vert{}=2$"));
+  assert.equal(result.match(/\|/g)?.length, 3, "row pipes still separate 4 cells");
+  assert.equal(result.split("|").length, 4);
+});
+
+test("tables: |x| outside a table row is left alone", () => {
+  const input = "$|x|=2$";
+  assert.equal(convertLatexDelimiters(input), input);
+});
+
+test("tables: currency cells are not mistaken for math", () => {
+  const prices = "| 课程 | $5 | $10 |";
+  assert.equal(convertLatexDelimiters(prices), prices);
+
+  const escapedPrices = "| 课程 | \\$5 | \\$10 |";
+  assert.equal(convertLatexDelimiters(escapedPrices), escapedPrices);
+});
+
+test("tables: only the real formula in a price row is rewritten", () => {
+  const input = "| 课程 | $5 | $|x|=2$ |";
+  const result = convertLatexDelimiters(input);
+
+  assert.equal(result, "| 课程 | $5 | $\\vert{}x\\vert{}=2$ |");
+  assert.equal(result.match(/\|/g)?.length, 4, "only the row's own pipes remain");
+  assert.equal(result.split("|").length, 5, "3 cells plus the edge pipes");
+});
+
+test("row spacing: \\\\[2pt] is not treated as a display-math delimiter", () => {
+  const input = "a \\\\[2pt] b";
+  const result = convertLatexDelimiters(input);
+
+  assert.equal(result, input);
+  assert.ok(!result.includes("$$"));
+});
+
+// ---------------------------------------------------------------------------
 // processLatexContent (thin wrapper)
 // ---------------------------------------------------------------------------
 
