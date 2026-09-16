@@ -60,4 +60,26 @@ describe("math Markdown rendering", () => {
     expect(container).not.toHaveTextContent("$f(x)=x^2$");
     expect(container).not.toHaveTextContent("$4$");
   });
+
+  it("renders inline formulas inside trace-variant thinking content with KaTeX", async () => {
+    const { container } = render(
+      <MarkdownRenderer variant="trace" content="先推导 $x^2 = 4$ 的解" />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    });
+    expect(container).not.toHaveTextContent("$x^2 = 4$");
+  });
+
+  it("keeps trace-variant content without formulas on the plain renderer", async () => {
+    const { container } = render(
+      <MarkdownRenderer variant="trace" content="思考：没有公式的普通文本" />,
+    );
+
+    await waitFor(() => {
+      expect(container).toHaveTextContent("没有公式的普通文本");
+    });
+    expect(container.querySelectorAll(".katex")).toHaveLength(0);
+  });
 });

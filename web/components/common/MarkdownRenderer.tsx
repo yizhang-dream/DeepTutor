@@ -49,8 +49,10 @@ export default function MarkdownRenderer({
   // append-only nature of streaming content this gives us a stable
   // Simple→Rich one-way transition (the Rich subtree mounts once and
   // stays). No additional lock state is needed.
+  // trace keeps the lightweight Simple renderer unless math is present,
+  // which is the only rich feature thinking cards actually need.
   const shouldUseRich =
-    variant !== "trace" &&
+    (variant !== "trace" || resolvedEnableMath) &&
     (trackSourceLines ||
       resolvedEnableMath ||
       resolvedEnableCode ||
