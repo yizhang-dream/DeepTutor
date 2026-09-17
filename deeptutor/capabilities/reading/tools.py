@@ -35,9 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
 from typing import Any
 
+from deeptutor.capabilities.reading.media_notes import render_media_note as _media_note
 from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolParameter, ToolResult
 from deeptutor.tools.prompting import load_prompt_hints
 
@@ -450,41 +450,6 @@ class ReadMaterialTool(_ReadingToolBase):
                 "truncated": rendered.truncated,
             },
         )
-
-
-def _media_note(store: Any, material_id: str, unit: str, locators: Sequence[int]) -> str:
-    """List the embedded images that live in the units just read.
-
-    The reader pane displays these images next to their unit, and the turn
-    already carries the ones on the user's current page — so when the user
-    asks about a figure, the model knows it exists, where it sits, and that
-    the image parts attached to the message are those figures.
-    """
-    try:
-        rows = store.media_items(material_id)
-    except Exception:
-        return ""
-    wanted = set(locators)
-    by_locator: dict[int, list[str]] = {}
-    for row in rows:
-        try:
-            locator = int(row.get("locator") or 0)
-        except (TypeError, ValueError):
-            continue
-        name = str(row.get("name") or "")
-        if locator in wanted and name:
-            by_locator.setdefault(locator, []).append(name)
-    if not by_locator:
-        return ""
-    lines = [
-        f"- {unit} {locator}: " + ", ".join(names)
-        for locator, names in sorted(by_locator.items())
-    ]
-    return (
-        "\n\nEmbedded images in the units above (shown in the reader pane; "
-        "image parts attached to this conversation's messages are these "
-        "figures):\n" + "\n".join(lines)
-    )
 
 
 class ReaderGotoTool(_ReadingToolBase):
