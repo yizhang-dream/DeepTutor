@@ -48,6 +48,25 @@ MAX_TOTAL_IMAGE_BYTES_PER_DOC = 12 * 1024 * 1024
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MIN_IMAGE_BYTES = 1_200  # below this it is a bullet point or a divider, not a figure
 
+
+def reading_image_budget() -> ImageBudget:
+    """Looser per-document caps for the reading-area ingest path.
+
+    The reading store keeps the image bytes on disk, and a single chat turn
+    inflates only the *current page's* images into the request, so the caps
+    split in two directions: the document-wide caps can be far looser than the
+    chat-attachment defaults, while the per-page cap is tightened to what one
+    request can carry. ``max_images_per_page=4`` mirrors
+    ``READING_VIEWPORT_MAX_IMAGES`` in ``services/session/_turn_runtime_shared``
+    (kept as a literal so this utils module stays free of a services import).
+    """
+    return ImageBudget(
+        max_images=120,
+        max_total_bytes=60 * 1024 * 1024,
+        max_images_per_page=4,
+    )
+
+
 # Raster formats vision models and the browser can both consume. Everything
 # else (EMF/WMF vector, TIFF, SVG, …) is skipped with a note.
 SUPPORTED_IMAGE_EXTENSIONS: frozenset[str] = frozenset(
@@ -85,11 +104,16 @@ class ImageBudget:
     max_total_bytes: int = MAX_TOTAL_IMAGE_BYTES_PER_DOC
     max_image_bytes: int = MAX_IMAGE_BYTES
     min_image_bytes: int = MIN_IMAGE_BYTES
+    # 0 = unlimited. Only the per-page walkers (PDF) enforce this; it keeps one
+    # page from monopolising the document budget when a single request can only
+    # carry a handful of images.
+    max_images_per_page: int = 0
     count: int = 0
     total_bytes: int = 0
     skipped_vector: int = 0
     skipped_other: int = 0
     skipped_budget: int = 0
+    skipped_page_budget: int = 0
 
     def register_vector_skip(self) -> None:
         self.skipped_vector += 1
@@ -122,6 +146,7 @@ class ImageCollection:
     skipped_vector: int = 0
     skipped_other: int = 0
     skipped_budget: int = 0
+    skipped_page_budget: int = 0
 
     def summary_note(self) -> str:
         """One-line note for the extracted text describing what was dropped."""
@@ -132,6 +157,8 @@ class ImageCollection:
             parts.append(f"{self.skipped_other} 张不支持的图片格式未提取")
         if self.skipped_budget:
             parts.append(f"{self.skipped_budget} 张图片超出数量/大小上限未提取")
+        if self.skipped_page_budget:
+            parts.append(f"{self.skipped_page_budget} 张超出单页上限未提取")
         if not parts:
             return ""
         return "[" + "，".join(parts) + "]"
@@ -205,7 +232,7 @@ def _normalise_ext(ext: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_docx_rich(data: bytes) -> DocxRich:
+def extract_docx_rich(data: bytes, *, budget: ImageBudget | None = None) -> DocxRich:
     """Walk ``word/document.xml`` once, collecting ordered paragraphs and images.
 
     Only the main body is mined (header/footer images are decoration). A
@@ -213,7 +240,7 @@ def extract_docx_rich(data: bytes) -> DocxRich:
     marked at every position, so repeated/floating figures stay anchored to
     the text around them.
     """
-    budget = ImageBudget()
+    budget = budget or ImageBudget()
     images: list[EmbeddedImage] = []
     by_target: dict[str, EmbeddedImage] = {}
     attempted: set[str] = set()
@@ -328,6 +355,7 @@ def _collection_from(budget: ImageBudget, images: list[EmbeddedImage]) -> ImageC
         skipped_vector=budget.skipped_vector,
         skipped_other=budget.skipped_other,
         skipped_budget=budget.skipped_budget,
+        skipped_page_budget=budget.skipped_page_budget,
     )
 
 
@@ -336,7 +364,7 @@ def _collection_from(budget: ImageBudget, images: list[EmbeddedImage]) -> ImageC
 # ---------------------------------------------------------------------------
 
 
-def extract_pptx_rich(data: bytes) -> PptxRich:
+def extract_pptx_rich(data: bytes, *, budget: ImageBudget | None = None) -> PptxRich:
     """Slide texts with markers plus pictures, via python-pptx when available.
 
     python-pptx resolves picture placeholders and grouped shapes cleanly and
@@ -347,14 +375,14 @@ def extract_pptx_rich(data: bytes) -> PptxRich:
     try:
         from pptx import Presentation
     except ImportError:
-        return _extract_pptx_rich_ooxml(data)
+        return _extract_pptx_rich_ooxml(data, budget=budget)
 
     try:
         prs = Presentation(io.BytesIO(data))
     except Exception:
-        return _extract_pptx_rich_ooxml(data)
+        return _extract_pptx_rich_ooxml(data, budget=budget)
 
-    budget = ImageBudget()
+    budget = budget or ImageBudget()
     images: list[EmbeddedImage] = []
     slides: list[str] = []
     for slide in prs.slides:
@@ -406,9 +434,9 @@ def _collect_shape_rich(
             lines.append(text.strip())
 
 
-def _extract_pptx_rich_ooxml(data: bytes) -> PptxRich:
+def _extract_pptx_rich_ooxml(data: bytes, *, budget: ImageBudget | None = None) -> PptxRich:
     """Raw fallback: per-slide paragraph text + blip markers from slide rels."""
-    budget = ImageBudget()
+    budget = budget or ImageBudget()
     images: list[EmbeddedImage] = []
     slides: list[str] = []
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -477,19 +505,26 @@ def _rels_for(member: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_pdf_images(data: bytes) -> PdfImages:
+def extract_pdf_images(
+    data: bytes, *, budget: ImageBudget | None = None
+) -> PdfImages:
     """Raster images per page via PyMuPDF, deduplicated across the document.
 
     Running headers/footers embed the same logo xref on every page; only the
     first occurrence is kept so a 300-page PDF does not become 300 copies of
     the same banner.
+
+    ``budget`` defaults to the chat-attachment caps (unchanged behaviour). When
+    it carries a non-zero ``max_images_per_page``, a page stops admitting once
+    it hits that many images and the rest of that page's candidates are counted
+    as page-budget skips — dedup hits are still free and never counted.
     """
     try:
         import pymupdf
     except ImportError:
         return PdfImages()
 
-    budget = ImageBudget()
+    budget = budget or ImageBudget()
     images: list[EmbeddedImage] = []
     page_map: list[tuple[int, tuple[int, ...]]] = []
     seen_xrefs: set[int] = set()
@@ -498,6 +533,7 @@ def extract_pdf_images(data: bytes) -> PdfImages:
         with pymupdf.open(stream=data, filetype="pdf") as doc:
             for page_number, page in enumerate(doc, 1):
                 indices: list[int] = []
+                admitted_on_page = 0
                 for info in page.get_images(full=True):
                     xref = info[0]
                     if xref in seen_xrefs:
@@ -519,10 +555,16 @@ def extract_pdf_images(data: bytes) -> PdfImages:
                     if ext not in SUPPORTED_IMAGE_EXTENSIONS:
                         budget.register_other_skip()
                         continue
+                    if budget.max_images_per_page and (
+                        admitted_on_page >= budget.max_images_per_page
+                    ):
+                        budget.skipped_page_budget += 1
+                        continue
                     admitted = budget.try_admit(ext, raw)
                     if admitted is not None:
                         images.append(admitted)
                         indices.append(len(images) - 1)
+                        admitted_on_page += 1
                 if indices:
                     page_map.append((page_number, tuple(indices)))
     except Exception:
@@ -544,6 +586,7 @@ __all__ = [
     "build_marker",
     "find_markers",
     "image_index_from_name",
+    "reading_image_budget",
     "extract_docx_rich",
     "extract_pptx_rich",
     "extract_pdf_images",

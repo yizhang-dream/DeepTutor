@@ -17,6 +17,7 @@ from pptx.util import Inches as PptxInches
 import pytest
 
 from deeptutor.utils.document_images import (
+    ImageBudget,
     build_marker,
     extract_docx_rich,
     extract_pdf_images,
@@ -185,3 +186,53 @@ def test_pdf_images_deduplicates_repeated_xref(tmp_path) -> None:
     result = extract_pdf_images(pdf_path.read_bytes())
     assert len(result.collection.images) == 1
     assert [page for page, _ in result.page_map] == [1]
+
+
+def _png_for_index(index: int) -> bytes:
+    """Distinct (content-wise) noisy PNG per index, all 64px+ and >min bytes."""
+    return _png_bytes((120 + index, 120))
+
+
+def _pdf_with_images(tmp_path, count: int) -> bytes:
+    """One page carrying *count* distinct embedded images."""
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    for index in range(count):
+        rect = pymupdf.Rect(72, 72 + index * 40, 180, 108 + index * 40)
+        page.insert_image(rect, stream=_png_for_index(index))
+    pdf_path = tmp_path / f"many-{count}.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return pdf_path.read_bytes()
+
+
+def test_pdf_images_respects_per_page_cap(tmp_path) -> None:
+    """A page stops admitting at max_images_per_page; the rest are counted."""
+    data = _pdf_with_images(tmp_path, 6)
+    result = extract_pdf_images(data, budget=ImageBudget(max_images_per_page=4))
+
+    assert len(result.collection.images) == 4
+    assert result.collection.skipped_page_budget == 2
+    assert result.collection.skipped_budget == 0
+    note = result.collection.summary_note()
+    assert "2 张超出单页上限未提取" in note
+
+
+def test_pdf_images_honours_custom_max_images(tmp_path) -> None:
+    data = _pdf_with_images(tmp_path, 6)
+    result = extract_pdf_images(data, budget=ImageBudget(max_images=2))
+
+    assert len(result.collection.images) == 2
+    assert result.collection.skipped_budget == 4
+    assert result.collection.skipped_page_budget == 0
+
+
+def test_pdf_images_default_budget_caps_at_twelve(tmp_path) -> None:
+    """No budget argument keeps the historical document-wide 12-image cap."""
+    data = _pdf_with_images(tmp_path, 14)
+    result = extract_pdf_images(data)
+
+    assert len(result.collection.images) == 12
+    assert result.collection.skipped_budget == 2
+    assert result.collection.skipped_page_budget == 0
