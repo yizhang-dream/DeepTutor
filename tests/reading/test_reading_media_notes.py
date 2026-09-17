@@ -28,6 +28,7 @@ from deeptutor.capabilities.reading.tools import _media_note
 from deeptutor.core.context import UnifiedContext
 
 import deeptutor.reading as reading_pkg
+from deeptutor.reading import page_render as page_render_module
 
 
 class _FakeStore:
@@ -198,3 +199,47 @@ def test_pre_loop_seed_skips_media_work_without_a_locator(monkeypatch, locator) 
     seed = ReadingCapability().pre_loop_seed(_viewport_context(locator))
 
     assert seed == ""
+
+
+def test_pre_loop_seed_announces_a_page_render(monkeypatch) -> None:
+    monkeypatch.setattr(reading_pkg, "ReadingStore", lambda: _FakeStore([]))
+    monkeypatch.setattr(
+        page_render_module, "page_has_render", lambda material_id, locator: True
+    )
+
+    seed = ReadingCapability().pre_loop_seed(_viewport_context(14))
+
+    assert "rendered image of that page" in seed
+    assert "Locator 14's content is drawn" in seed
+
+
+def test_pre_loop_seed_is_byte_for_byte_unchanged_without_a_page_render(monkeypatch) -> None:
+    monkeypatch.setattr(reading_pkg, "ReadingStore", lambda: _FakeStore([_row(4, "image-01.png")]))
+    monkeypatch.setattr(
+        page_render_module, "page_has_render", lambda material_id, locator: False
+    )
+
+    seed = ReadingCapability().pre_loop_seed(_viewport_context(4))
+
+    # Exactly the pre-render seed: the new sentence appears only when a render
+    # was actually attached.
+    assert seed == (
+        "The reader is currently showing locator 4. "
+        "Locator 4 contains 1 embedded image(s) from the document; "
+        "they are attached to this message, so read them directly when the question "
+        "concerns a figure."
+    )
+    assert "rendered image" not in seed
+
+
+def test_pre_loop_seed_survives_a_page_render_probe_failure(monkeypatch) -> None:
+    def _boom(material_id, locator):
+        raise RuntimeError("page render probe failed")
+
+    monkeypatch.setattr(reading_pkg, "ReadingStore", lambda: _FakeStore([]))
+    monkeypatch.setattr(page_render_module, "page_has_render", _boom)
+
+    seed = ReadingCapability().pre_loop_seed(_viewport_context(4))
+
+    assert seed == "The reader is currently showing locator 4."
+    assert "rendered image" not in seed

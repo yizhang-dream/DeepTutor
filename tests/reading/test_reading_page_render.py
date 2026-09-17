@@ -19,10 +19,10 @@ from pathlib import Path
 
 import pytest
 
+from deeptutor.reading.page_render import page_has_render, page_render_record
 from deeptutor.services.path_service import PathService
 from deeptutor.services.session._turn_runtime_shared import (
     READING_VIEWPORT_MAX_IMAGES,
-    _reading_page_has_render,
     _reading_viewport_image_attachments,
     _reading_viewport_page_render,
 )
@@ -119,7 +119,7 @@ def test_drawn_page_renders_and_leads_attachments(reading_home: Path) -> None:
     manifest = _ingest_deck(reading_home, embedded_images=1)
     material_id = manifest.material_id
 
-    record = _reading_viewport_page_render(material_id, 1)
+    record = page_render_record(material_id, 1)
 
     assert record is not None
     assert record["mime_type"] == "image/jpeg"
@@ -143,7 +143,7 @@ def test_prose_only_page_has_no_render(reading_home: Path) -> None:
     manifest = _ingest_deck(reading_home)
     material_id = manifest.material_id
 
-    assert _reading_viewport_page_render(material_id, 2) is None
+    assert page_render_record(material_id, 2) is None
     attachments = _reading_viewport_image_attachments(material_id, {"locator": 2})
     assert all(item["id"].startswith("rv-") for item in attachments)
 
@@ -171,8 +171,24 @@ def test_has_render_matches_render_gate(reading_home: Path) -> None:
     manifest = _ingest_deck(reading_home)
     material_id = manifest.material_id
 
-    assert _reading_page_has_render(material_id, 1) is True
-    assert _reading_page_has_render(material_id, 2) is False
+    assert page_has_render(material_id, 1) is True
+    assert page_has_render(material_id, 2) is False
+
+
+def test_reading_layer_and_service_wrappers_agree(reading_home: Path) -> None:
+    """The reading-layer API and the session wrappers must be one behaviour."""
+    manifest = _ingest_deck(reading_home)
+    material_id = manifest.material_id
+
+    native = page_render_record(material_id, 1)
+    wrapped = _reading_viewport_page_render(material_id, 1)
+    assert native is not None and wrapped is not None
+    assert native["id"] == wrapped["id"]
+    assert native["filename"] == wrapped["filename"]
+    assert native["base64"] == wrapped["base64"]
+    assert page_has_render(material_id, 1) is True
+    assert page_has_render(material_id, 2) is False
+    assert _reading_viewport_page_render(material_id, 2) is None
 
 
 def test_invalid_inputs_do_not_raise(reading_home: Path) -> None:
@@ -180,16 +196,24 @@ def test_invalid_inputs_do_not_raise(reading_home: Path) -> None:
     material_id = manifest.material_id
 
     # Bad material ids.
+    assert page_render_record("", 1) is None
+    assert page_render_record("zzz", 1) is None
+    assert page_has_render("", 1) is False
+    assert page_has_render("zzz", 1) is False
     assert _reading_viewport_page_render("", 1) is None
     assert _reading_viewport_page_render("zzz", 1) is None
-    assert _reading_page_has_render("", 1) is False
-    assert _reading_page_has_render("zzz", 1) is False
+    assert page_has_render("", 1) is False
+    assert page_has_render("zzz", 1) is False
     assert _reading_viewport_image_attachments("", {"locator": 1}) == []
 
     # Out-of-range locators.
+    assert page_render_record(material_id, 0) is None
+    assert page_render_record(material_id, 999) is None
+    assert page_has_render(material_id, 0) is False
+    assert page_has_render(material_id, 999) is False
     assert _reading_viewport_page_render(material_id, 0) is None
     assert _reading_viewport_page_render(material_id, 999) is None
-    assert _reading_page_has_render(material_id, 0) is False
-    assert _reading_page_has_render(material_id, 999) is False
+    assert page_has_render(material_id, 0) is False
+    assert page_has_render(material_id, 999) is False
     assert _reading_viewport_image_attachments(material_id, {"locator": 999}) == []
     assert _reading_viewport_image_attachments(material_id, {}) == []
