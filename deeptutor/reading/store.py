@@ -381,6 +381,152 @@ class ReadingStore:
                 shutil.rmtree(backup_dir, ignore_errors=True)
             return manifest
 
+    def refresh_document(self, material_id: str) -> MaterialManifest:
+        """Re-extract a material in place from its stored original bytes.
+
+        Used to pick up extractor improvements (embedded-image captions, a
+        better text layer) without asking the user to re-upload: the source
+        bytes under ``raw/`` are parsed again and the units, media and manifest
+        are replaced atomically. User-owned state — annotations, positions,
+        bookmarks and preserved revisions — is carried across untouched.
+
+        The whole result is computed and validated *before* anything is
+        written. If the raw bytes are gone, or re-extraction would change the
+        unit count (locators would silently shift under the annotations and
+        reading positions), this raises :class:`ReadingError` and leaves every
+        file exactly as it was.
+        """
+        resolved_id = self._validate_id(material_id)
+        with self._locked(resolved_id):
+            existing = self._load_manifest(resolved_id)
+            if existing is None:
+                raise MaterialNotFound(f"material {material_id!r} not found")
+            material_dir = self._dir(resolved_id)
+            raw_path = self._find_raw(material_dir)
+            if raw_path is None:
+                raise ReadingError(
+                    f"{existing.filename}: the original file is no longer stored, "
+                    "so this material cannot be re-extracted."
+                )
+
+            # Validate the new extraction fully before touching the store.
+            extraction = extract_material(raw_path)
+            if len(extraction.units) != existing.unit_count:
+                raise ReadingError(
+                    f"{existing.filename}: re-extraction produced "
+                    f"{len(extraction.units)} units, not the stored "
+                    f"{existing.unit_count}; refusing to shift locators."
+                )
+
+            # Captions cost a vision-model call each, so a re-extraction that
+            # does not re-caption (CLI ``--no-caption``) must carry the old
+            # ones forward by image name: same figure in, same caption out.
+            previous_captions = {
+                str(row.get("name")): str(row.get("caption"))
+                for row in (self.media_items(resolved_id) or [])
+                if row.get("name") and str(row.get("caption") or "").strip()
+            }
+
+            stage_dir = self.root / f".{resolved_id}.{uuid.uuid4().hex[:8]}.staging"
+            backup_dir = self.root / f".{resolved_id}.{uuid.uuid4().hex[:8]}.backup"
+            (stage_dir / UNITS_DIR).mkdir(parents=True, exist_ok=True)
+            for index, unit in enumerate(extraction.units, start=1):
+                self._unit_file(stage_dir, index).write_text(unit, encoding="utf-8")
+
+            media_rows: list[dict[str, Any]] = []
+            if extraction.media:
+                media_dir = stage_dir / MEDIA_DIR
+                media_dir.mkdir(parents=True, exist_ok=True)
+                for item in extraction.media:
+                    (media_dir / item.name).write_bytes(item.data)
+                    row: dict[str, Any] = {
+                        "name": item.name,
+                        "locator": item.locator,
+                        "mime": item.mime_type,
+                        "bytes": len(item.data),
+                    }
+                    caption = previous_captions.get(item.name)
+                    if caption:
+                        row["caption"] = caption
+                    media_rows.append(row)
+                _atomic_write(
+                    stage_dir / MEDIA_INDEX_NAME,
+                    json.dumps(media_rows, ensure_ascii=False),
+                )
+
+            outline = (
+                extraction.outline
+                if extraction.outline or extraction.render_mode == "pdf"
+                else synthesise_outline(extraction.units)
+            )
+            _atomic_write(
+                stage_dir / OUTLINE_NAME,
+                json.dumps([entry.to_dict() for entry in outline], ensure_ascii=False),
+            )
+            _atomic_write(
+                stage_dir / UNIT_REFS_NAME,
+                json.dumps(
+                    [entry.to_dict() for entry in extraction.unit_refs],
+                    ensure_ascii=False,
+                ),
+            )
+            manifest = MaterialManifest(
+                material_id=existing.material_id,
+                filename=existing.filename,
+                unit=extraction.unit,
+                unit_count=len(extraction.units),
+                mime=existing.mime,
+                title=extraction.title or existing.title,
+                source_hash=existing.source_hash,
+                extractor=extraction.extractor,
+                byte_size=raw_path.stat().st_size,
+                char_count=extraction.char_count,
+                created_at=existing.created_at,
+                has_raw_view=existing.has_raw_view,
+                render_mode=existing.render_mode,
+                media_count=len(media_rows),
+                content_format=existing.content_format,
+                source_type=existing.source_type,
+                source_url=existing.source_url,
+                revision=existing.revision + 1,
+            )
+            _atomic_write(
+                stage_dir / MANIFEST_NAME,
+                json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2),
+            )
+
+            # Keep the original bytes (linked, not duplicated) and every
+            # user-owned side file, exactly as a re-ingest would. Generated
+            # rasters live under assets/; re-extraction does not rewrite them,
+            # so they must be carried across or a web snapshot would lose its
+            # images.
+            _carry_dir(material_dir / RAW_DIR, stage_dir / RAW_DIR)
+            _carry_dir(material_dir / ASSETS_DIR, stage_dir / ASSETS_DIR)
+            for state_dir in (ANNOTATIONS_DIR, POSITIONS_DIR, BOOKMARKS_DIR, REVISIONS_DIR):
+                source_state_dir = material_dir / state_dir
+                if source_state_dir.is_dir():
+                    shutil.copytree(
+                        source_state_dir, stage_dir / state_dir, dirs_exist_ok=True
+                    )
+            for state_name in (ANNOTATIONS_NAME, POSITION_NAME):
+                source_state = material_dir / state_name
+                if source_state.is_file():
+                    shutil.copy2(source_state, stage_dir / state_name)
+
+            try:
+                if material_dir.exists():
+                    os.replace(material_dir, backup_dir)
+                try:
+                    os.replace(stage_dir, material_dir)
+                except Exception:
+                    if backup_dir.exists() and not material_dir.exists():
+                        os.replace(backup_dir, material_dir)
+                    raise
+            finally:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            return self.manifest(resolved_id)
+
     def ingest_units(
         self,
         material_id: str,
@@ -746,6 +892,42 @@ class ReadingStore:
             return None
         path = self._dir(material_id) / MEDIA_DIR / clean
         return path if path.is_file() else None
+
+    def update_media_captions(
+        self, material_id: str, captions: Mapping[str, str]
+    ) -> int:
+        """Write per-image captions into the media index. Returns rows changed.
+
+        *captions* maps an image name to its text. Names absent from the index
+        are ignored silently (extraction may have dropped a figure), and an
+        empty value leaves the existing caption alone rather than erasing it.
+        The index is only rewritten when something actually changed, under the
+        same per-material lock every other write uses.
+        """
+        wanted = {
+            str(name): str(value).strip()
+            for name, value in captions.items()
+            if str(value or "").strip()
+        }
+        if not wanted:
+            return 0
+        index_path = self._dir(material_id) / MEDIA_INDEX_NAME
+        with self._locked(material_id):
+            rows = _read_json(index_path)
+            if not isinstance(rows, list):
+                return 0
+            changed = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or "")
+                caption = wanted.get(name)
+                if caption and str(row.get("caption") or "") != caption:
+                    row["caption"] = caption
+                    changed += 1
+            if changed:
+                _atomic_write(index_path, json.dumps(rows, ensure_ascii=False))
+            return changed
 
     def _has_raw(self, material_id: str) -> bool:
         """Whether original bytes are already on disk, without loading them."""

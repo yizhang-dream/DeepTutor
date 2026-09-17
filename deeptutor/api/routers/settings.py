@@ -333,6 +333,8 @@ class DocumentParsingUpdate(BaseModel):
     engines: Optional[dict[str, dict]] = None
     # Toggle for the empty-result → MinerU OCR retry (None = keep stored).
     ocr_fallback: Optional[bool] = None
+    # Toggle for vision-model captions of embedded images (None = keep stored).
+    image_caption: Optional[bool] = None
 
 
 class DocumentParsingTest(BaseModel):
@@ -1066,6 +1068,7 @@ def _document_parsing_payload() -> dict[str, Any]:
     return {
         "engine": full.get("engine"),
         "ocr_fallback": bool(full.get("ocr_fallback", True)),
+        "image_caption": bool(full.get("image_caption", False)),
         "engines": redacted,
         "available_engines": available,
         "readiness": readiness,
@@ -1162,8 +1165,18 @@ async def update_document_parsing_settings(payload: DocumentParsingUpdate):
         if payload.ocr_fallback is not None
         else bool(full.get("ocr_fallback", True))
     )
+    image_caption = (
+        payload.image_caption
+        if payload.image_caption is not None
+        else bool(full.get("image_caption", False))
+    )
     service.save_document_parsing(
-        {"engine": new_engine, "ocr_fallback": ocr_fallback, "engines": engines}
+        {
+            "engine": new_engine,
+            "ocr_fallback": ocr_fallback,
+            "image_caption": image_caption,
+            "engines": engines,
+        }
     )
     return _document_parsing_payload()
 

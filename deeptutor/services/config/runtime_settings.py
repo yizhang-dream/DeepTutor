@@ -238,6 +238,9 @@ DEFAULT_DOCUMENT_PARSING_SETTINGS: dict[str, Any] = {
     # When the active engine extracts no content at all (scanned PDF under a
     # text-layer extractor), automatically retry with the MinerU engine.
     "ocr_fallback": True,
+    # Caption embedded figures with a vision model at ingest, so a text-only
+    # model reading the material can still describe its images.
+    "image_caption": False,
     "engines": {
         DOCUMENT_PARSING_ENGINE_TEXT_ONLY: _DEFAULT_TEXT_ONLY_ENGINE,
         DOCUMENT_PARSING_ENGINE_MINERU: _DEFAULT_MINERU_ENGINE,
@@ -1034,6 +1037,7 @@ class RuntimeSettingsService:
             "version": 2,
             "engine": engine,
             "ocr_fallback": _coerce_bool(settings.get("ocr_fallback"), True),
+            "image_caption": _coerce_bool(settings.get("image_caption"), False),
             "engines": engines_out,
         }
 
