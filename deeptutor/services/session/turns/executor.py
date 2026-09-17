@@ -41,7 +41,7 @@ from .._turn_runtime_shared import (
     _reading_material_revision,
     _reading_references,
     _reading_viewport,
-    _reading_viewport_image_records,
+    _reading_viewport_image_attachments,
     _reading_workspace_id,
     _repair_chinese_emphasis_for_persistence,
     _request_snapshot_metadata,
@@ -331,18 +331,20 @@ class TurnExecutor:
 
             document_texts, attachment_records = extract_documents_from_records(attachment_records)
 
-            # Immersive reading: the embedded figures on the page the user is
-            # currently looking at ride along as image attachments, so a
-            # vision model sees what the question is about. Pages without
-            # images add nothing; pages with them add at most
-            # READING_VIEWPORT_MAX_IMAGES attachments. Keyed on the resolved
-            # workspace mode — the web composer sends capability "chat" with
-            # workspace_mode "immersive_reading", and the mode resolver falls
-            # back to the capability name for direct callers, so both shapes
-            # land here.
+            # Immersive reading: the page the user is currently looking at
+            # rides along as image attachments, so a vision model sees what
+            # the question is about. A drawn page (vector diagram — common in
+            # slide-exported PDFs) leads with a full-page render, since its
+            # figures only exist as vectors and the embedded rasters alone
+            # would be meaningless fragments; the page's embedded figures
+            # follow. Total stays within READING_VIEWPORT_MAX_IMAGES (the
+            # render takes one slot). Keyed on the resolved workspace mode —
+            # the web composer sends capability "chat" with workspace_mode
+            # "immersive_reading", and the mode resolver falls back to the
+            # capability name for direct callers, so both shapes land here.
             if workspace_mode == "immersive_reading":
                 attachment_records.extend(
-                    _reading_viewport_image_records(
+                    _reading_viewport_image_attachments(
                         _reading_material_id(payload.get("reading_material_id")),
                         _reading_viewport(payload.get("reading_viewport")),
                     )

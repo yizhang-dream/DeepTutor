@@ -616,6 +616,108 @@ def _reading_viewport(value: Any) -> dict[str, Any]:
 # Images attached per reading turn when the open page has embedded figures.
 READING_VIEWPORT_MAX_IMAGES = 4
 
+#: Page raster DPI for the "whole page is drawn" fallback. 110 dpi at JPEG
+#: quality 82 measures ~132 KB / ~60 ms per page — small enough to ride along
+#: with every turn, sharp enough to read the figure labels.
+READING_VIEWPORT_RENDER_DPI = 110
+
+#: A page with at least this many vector drawing objects is a diagram page
+#: (slide exports hit 40+; prose-only pages stay at 0-7), so a full-page
+#: render adds signal instead of duplicating the text channel.
+READING_VIEWPORT_MIN_DRAWINGS = 8
+
+
+def _reading_viewport_page_render(material_id: str, locator: int) -> dict | None:
+    """Render the currently open page to a JPEG when it is mainly drawn.
+
+    Slide-exported PDFs draw their figures as vectors, so ``page.get_images()``
+    only yields shadow fragments and a vision model has nothing to read. When
+    the page carries enough vector primitives, rasterise the whole page — labels
+    and all — into one attachment record shaped like the embedded-image ones.
+    Best-effort by contract: any failure logs and returns ``None`` rather than
+    breaking the turn.
+    """
+    try:
+        if not material_id or locator <= 0:
+            return None
+        import base64
+
+        import pymupdf
+
+        from deeptutor.reading import ReadingStore
+
+        raw = ReadingStore().raw_path(material_id)
+        if raw is None or raw.suffix.lower() != ".pdf" or not raw.is_file():
+            return None
+        with pymupdf.open(raw) as doc:
+            if not 1 <= locator <= doc.page_count:
+                return None
+            page = doc[locator - 1]
+            if len(page.get_drawings()) < READING_VIEWPORT_MIN_DRAWINGS:
+                return None
+            pixmap = page.get_pixmap(dpi=READING_VIEWPORT_RENDER_DPI)
+            image_bytes = pixmap.tobytes("jpeg", jpg_quality=82)
+        return {
+            "type": "image",
+            "url": "",
+            "base64": base64.b64encode(image_bytes).decode("ascii"),
+            "filename": f"{raw.stem}-page-{locator}.jpg",
+            "mime_type": "image/jpeg",
+            "id": f"rp-{material_id[:12]}-{locator}",
+            "embedded": True,
+        }
+    except Exception:
+        logger.warning("reading viewport page render failed", exc_info=True)
+        return None
+
+
+def _reading_page_has_render(material_id: str, locator: int) -> bool:
+    """Whether the open page qualifies for a full-page render (probe only).
+
+    Mirrors :func:`_reading_viewport_page_render`'s gate — raw PDF and enough
+    vector primitives — without paying the rasterisation, so capability
+    narration can mention the page image cheaply. Failures return ``False``.
+    """
+    try:
+        if not material_id or locator <= 0:
+            return False
+        import pymupdf
+
+        from deeptutor.reading import ReadingStore
+
+        raw = ReadingStore().raw_path(material_id)
+        if raw is None or raw.suffix.lower() != ".pdf" or not raw.is_file():
+            return False
+        with pymupdf.open(raw) as doc:
+            if not 1 <= locator <= doc.page_count:
+                return False
+            return len(doc[locator - 1].get_drawings()) >= READING_VIEWPORT_MIN_DRAWINGS
+    except Exception:
+        logger.warning("reading page render probe failed", exc_info=True)
+        return False
+
+
+def _reading_viewport_image_attachments(material_id: str, viewport: dict[str, Any]) -> list[dict]:
+    """Attachments for the open page: its render first, embedded figures after.
+
+    A drawn page leads with the whole-page raster (the only way a vision model
+    sees a vector diagram); embedded rasters follow. The render consumes one of
+    the ``READING_VIEWPORT_MAX_IMAGES`` slots, and the total is capped there.
+    Pages that do not qualify fall back to the embedded-image records alone.
+    """
+    viewport = viewport if isinstance(viewport, dict) else {}
+    embedded = _reading_viewport_image_records(material_id, viewport)
+    try:
+        locator = int(viewport.get("locator") or 0)
+    except (TypeError, ValueError):
+        locator = 0
+    if not material_id or locator <= 0:
+        return embedded[:READING_VIEWPORT_MAX_IMAGES]
+    rendered = _reading_viewport_page_render(material_id, locator)
+    if rendered is None:
+        return embedded[:READING_VIEWPORT_MAX_IMAGES]
+    return [rendered, *embedded[: READING_VIEWPORT_MAX_IMAGES - 1]]
+
 
 def _reading_viewport_image_records(material_id: str, viewport: dict[str, Any]) -> list[dict]:
     """Image attachment records for the figures on the currently open page."""
