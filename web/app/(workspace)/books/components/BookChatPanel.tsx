@@ -7,7 +7,6 @@ import type {
   ChangeEvent,
   ClipboardEvent,
   KeyboardEvent,
-  MouseEvent as ReactMouseEvent,
 } from "react";
 import {
   FileText,
@@ -20,6 +19,7 @@ import {
 import { useTranslation } from "react-i18next";
 import AssistantResponse from "@/components/common/AssistantResponse";
 import { useAppShell } from "@/context/AppShellContext";
+import { usePaneResize } from "@/hooks/usePaneResize";
 import { getSession } from "@/lib/session-api";
 import {
   ATTACHMENT_ACCEPT,
@@ -117,7 +117,6 @@ export default function BookChatPanel({
   const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const { isComposingRef, onCompositionStart, onCompositionEnd } =
     useImeComposing();
 
@@ -297,26 +296,18 @@ export default function BookChatPanel({
     retryTimersRef.current.add(timer);
   }
 
-  function beginResize(event: ReactMouseEvent<HTMLDivElement>) {
-    event.preventDefault();
-    dragRef.current = { startX: event.clientX, startWidth: width };
-    const onMove = (moveEvent: MouseEvent) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const next = Math.max(
-        300,
-        Math.min(720, drag.startWidth + drag.startX - moveEvent.clientX),
-      );
-      setWidth(next);
-    };
-    const onUp = () => {
-      dragRef.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }
+  // Panel width clamp is unchanged (300–720px, growing as the handle moves
+  // left); persistence stays in the effect on ``width`` above, so the final
+  // value lands on every terminal pointer event (up/cancel/lostpointercapture).
+  const { onPointerDown: beginResize } = usePaneResize({
+    getStartWidth: () => width,
+    computeWidth: (startWidth, event, start) =>
+      Math.max(300, Math.min(720, startWidth + start.clientX - event.clientX)),
+    onWidth: setWidth,
+    // Idempotent final commit: the hook reports the last width through onEnd
+    // (up / cancel / lostpointercapture), so a cancel still lands the value.
+    onEnd: setWidth,
+  });
 
   function filterFiles(files: File[]): File[] {
     setAttachmentError(null);
@@ -427,8 +418,8 @@ export default function BookChatPanel({
         role="separator"
         aria-orientation="vertical"
         title={t("Drag to resize")}
-        onMouseDown={beginResize}
-        className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize bg-transparent transition-colors hover:bg-[var(--primary)]/30"
+        onPointerDown={beginResize}
+        className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize touch-none select-none bg-transparent transition-colors hover:bg-[var(--primary)]/30"
       />
       <header className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
         <div className="min-w-0">

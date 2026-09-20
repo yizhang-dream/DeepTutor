@@ -57,6 +57,7 @@ import QuizFollowupTabBody from "@/components/quiz/QuizFollowupTabBody";
 import SubagentTabBody from "@/components/chat/home/SubagentTabBody";
 import type { QuizFollowupTabContext } from "@/context/QuizFollowupContext";
 import type { GeogebraTabPayload } from "@/context/GeogebraTabContext";
+import { usePaneResize } from "@/hooks/usePaneResize";
 import { apiUrl } from "@/lib/api";
 import type { MessageAttachment } from "@/features/chat/ChatStateAdapter";
 import type { StreamEvent } from "@/features/chat/model/protocol";
@@ -286,42 +287,61 @@ function SessionViewerPanelInner(
     );
   }, []);
 
-  const startResize = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    document.documentElement.dataset.viewerResizing = "true";
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
-
-    let rafId = 0;
-    let pendingX = e.clientX;
-    const apply = () => {
-      rafId = 0;
-      const w = clampViewerWidth(window.innerWidth - pendingX);
-      widthRef.current = w;
-      document.documentElement.style.setProperty(VIEWER_WIDTH_VAR, `${w}px`);
-    };
-    const onMove = (ev: PointerEvent) => {
-      // Coalesce to one var write per frame — pointermove can fire faster
-      // than the display refreshes.
-      pendingX = ev.clientX;
-      if (!rafId) rafId = requestAnimationFrame(apply);
-    };
-    const onUp = () => {
-      if (rafId) cancelAnimationFrame(rafId);
+  // Drag chrome (dataset flag + body cursor) is toggled around the drag; the
+  // ``viewerResizing`` dataset is what lets CSS kill the width transition
+  // while the handle is held.
+  const setResizeChrome = useCallback((active: boolean) => {
+    if (active) {
+      document.documentElement.dataset.viewerResizing = "true";
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+    } else {
       delete document.documentElement.dataset.viewerResizing;
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
+    }
+  }, []);
+
+  const rafRef = useRef(0);
+
+  const { onPointerDown: startResize } = usePaneResize({
+    // Called once per accepted pointerdown; onEnd below always runs exactly
+    // once (up / cancel / lostpointercapture / unmount), so the chrome and the
+    // persisted width stay balanced even when the pointer is lost.
+    getStartWidth: () => {
+      setResizeChrome(true);
+      return widthRef.current;
+    },
+    computeWidth: (_startWidth, event) =>
+      clampViewerWidth(window.innerWidth - event.clientX),
+    onWidth: (width) => {
+      // Coalesce to one var write per frame — pointermove can fire faster
+      // than the display refreshes.
+      widthRef.current = width;
+      if (rafRef.current) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = 0;
+        document.documentElement.style.setProperty(
+          VIEWER_WIDTH_VAR,
+          `${widthRef.current}px`,
+        );
+      });
+    },
+    onEnd: (width) => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = 0;
+      }
+      widthRef.current = width;
+      document.documentElement.style.setProperty(VIEWER_WIDTH_VAR, `${width}px`);
+      setResizeChrome(false);
       browserStorage.writeRaw(
         "local",
         VIEWER_WIDTH_KEY,
-        String(widthRef.current),
+        String(width),
       );
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }, []);
+    },
+  });
 
   // Wipe tabs whenever the session changes — preview/web state belongs to
   // the conversation that triggered it.
@@ -669,9 +689,9 @@ function SessionViewerPanelInner(
         role="separator"
         aria-orientation="vertical"
         aria-label={t("Resize viewer")}
-        className="group/resize absolute left-0 top-0 z-10 h-full w-2 -translate-x-1/2 cursor-col-resize max-md:hidden"
+        className="group/resize absolute left-0 top-0 z-10 h-full w-2 -translate-x-1/2 cursor-col-resize touch-none select-none max-md:hidden"
       >
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent transition-colors group-hover/resize:bg-[var(--primary)]/40" />
+        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 touch-none bg-transparent transition-colors group-hover/resize:bg-[var(--primary)]/40" />
       </div>
       <TabBar
         tabs={tabs}

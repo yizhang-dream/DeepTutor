@@ -161,6 +161,10 @@ export interface ChatState {
   personaSelection: string;
   messages: MessageItem[];
   isStreaming: boolean;
+  /** Server id of the turn currently live in this session, if any. Lets
+   *  consumers scope per-turn decisions (e.g. "is the visible card a pause
+   *  of THIS turn?") without re-deriving it from the message list. */
+  activeTurnId: string | null;
   currentStage: string;
   language: string;
   /** Edit-branching: keyed by stringified parent_message_id (or "null"
@@ -1133,6 +1137,19 @@ const initialState: ProviderState = {
 const POST_DONE_DISCONNECT_DELAY_MS = 15_000;
 
 /**
+ * How long after a socket drop during a paused (ask_user) turn to re-pull
+ * the session from the server.
+ *
+ * The runtime client keeps its own auto-reconnect running, and the HTTP
+ * fetch below rides a different connection than the WS — so even while the
+ * socket is still coming back, this refresh re-syncs the authoritative turn
+ * state: whether the pause still stands, or the turn settled while we were
+ * dark. The runtime's close→recover→connected transitions are its own
+ * state machine; the UI never mirrors them, it only re-syncs after a beat.
+ */
+const PAUSED_DISCONNECT_REFETCH_MS = 4_000;
+
+/**
  * How long after DONE to refetch the sidebar so a post-turn title shows up.
  *
  * The title is written *after* the turn finishes (see `title_service`), so the
@@ -1162,6 +1179,13 @@ interface ChatContextValue {
   setCourseId: (courseId: string) => void;
   setPersonaSelection: (persona: string) => void;
   setLanguage: (lang: string) => void;
+  /**
+   * Start a new turn. Resolves with whether the start command actually
+   * reached a connected socket — ``false`` after the connect-retry budget
+   * ran out (the adapter has already marked the turn failed and raised a
+   * toast by then). Callers that restore discarded composer input on a
+   * refused send need that answer.
+   */
   sendMessage: (
     content: string,
     attachments?: OutgoingAttachment[],
@@ -1172,7 +1196,7 @@ interface ChatContextValue {
     questionNotebookReferences?: QuestionNotebookReferencePayload,
     persona?: string,
     memoryReferences?: MemoryReferencePayload,
-  ) => void;
+  ) => Promise<boolean>;
   cancelStreamingTurn: () => void;
   /**
    * Deliver the user's reply for a turn that is paused on an
@@ -1428,6 +1452,12 @@ export function ChatStateAdapterProvider({
   >(new Map());
   const draftCounterRef = useRef(0);
   const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  // One pending re-pull per session key after a socket drop while a turn is
+  // paused on an ask_user card (see PAUSED_DISCONNECT_REFETCH_MS). Re-armed
+  // rather than stacked so repeated close events schedule a single fetch.
+  const pausedRefetchTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
   // Tracks in-flight regenerate requests so we can restore the popped
   // assistant message if the server rejects the request (e.g. ``regenerate_busy``
   // or ``nothing_to_regenerate``). Keyed by session entry key.
@@ -1613,6 +1643,42 @@ export function ChatStateAdapterProvider({
         }
         return;
       }
+      if (event.type === "protocol_error") {
+        const meta = event.metadata as {
+          error_code?: string;
+          message?: string;
+        };
+        if (meta?.error_code === "start_turn_rejected") {
+          // The server refused the new turn: the session still holds a live
+          // or recovering turn — usually one paused on an unanswered
+          // question. A locally-running turn is now a lie: settle it so the
+          // composer unlocks, tell the user why, and re-sync (the
+          // pending card, if any, survives per loadSession's guard) so the
+          // open question is back in play — the user answers it, or the
+          // re-sent deferred reply resumes the turn for them.
+          dispatch({
+            type: "STREAM_END",
+            key: effectiveKey,
+            status: "failed",
+          });
+          notify(
+            i18n.t(
+              "DeepTutor could not start that turn because the session already has an active one. Answer the open question or try again shortly.",
+            ),
+            {
+              tone: "error",
+              durationMs: 6000,
+            },
+          );
+          const rejected = stateRef.current.sessions[effectiveKey];
+          if (rejected?.sessionId) {
+            loadSessionRef.current?.(rejected.sessionId).catch(() => {
+              /* non-fatal — local state remains usable */
+            });
+          }
+        }
+        return;
+      }
       if (event.type === "done") {
         const status = String(
           (event.metadata as { status?: string } | undefined)?.status ||
@@ -1748,17 +1814,12 @@ export function ChatStateAdapterProvider({
         key,
         client: new UnifiedTurnClient(
           (event) => handleRunnerEvent(record.key, event),
+          // Fires only when the runtime gives up reconnecting ("idle") —
+          // reachable while no active turn id is set (retries are bounded
+          // then), never for a live turn.
           () => {
             const session = stateRef.current.sessions[record.key];
             if (session?.isStreaming) {
-              if (
-                hasPendingAskUserInMessages(
-                  session.messages,
-                  session.activeTurnId,
-                )
-              ) {
-                return;
-              }
               dispatch({
                 type: "STREAM_END",
                 key: record.key,
@@ -1777,6 +1838,59 @@ export function ChatStateAdapterProvider({
                 },
               );
             }
+          },
+          // Fires on every socket drop while the runtime walks its own
+          // auto-reconnect path ("recovering") — the only disconnect signal
+          // a paused turn can ever get, because a live turn id keeps the
+          // runtime reconnecting and "idle" out of reach.
+          () => {
+            const session = stateRef.current.sessions[record.key];
+            if (
+              !session?.isStreaming ||
+              !hasPendingAskUserInMessages(
+                session.messages,
+                session.activeTurnId,
+              )
+            ) {
+              return;
+            }
+            // The turn is parked on a question the user has not answered,
+            // so the pause card must survive — no STREAM_END here. But
+            // silence is its own failure: tell the user the connection
+            // dropped, then re-pull the session over HTTP (a different
+            // connection than the WS) after a beat so the paused state
+            // reflects what the server actually holds — it may have
+            // finished the turn while we were dark.
+            notify(
+              i18n.t("Reconnecting…"),
+              {
+                tone: "info",
+                durationMs: 6000,
+              },
+            );
+            const previous = pausedRefetchTimersRef.current.get(record.key);
+            if (previous) clearTimeout(previous);
+            const timerId = setTimeout(() => {
+              pausedRefetchTimersRef.current.delete(record.key);
+              const current = stateRef.current.sessions[record.key];
+              // Only while still paused: a STREAM_END that arrived in the
+              // meantime (cancel, reconnect replay) already settled the
+              // view.
+              if (
+                !current?.isStreaming ||
+                !current.sessionId ||
+                !hasPendingAskUserInMessages(
+                  current.messages,
+                  current.activeTurnId,
+                )
+              ) {
+                return;
+              }
+              loadSessionRef.current?.(current.sessionId).catch(() => {
+                /* non-fatal — local state remains usable */
+              });
+            }, PAUSED_DISCONNECT_REFETCH_MS);
+            pausedRefetchTimersRef.current.set(record.key, timerId);
           },
         ),
       };
@@ -1953,6 +2067,20 @@ export function ChatStateAdapterProvider({
         // what we have, and the snapshot predates the turn anyway.
         const local = stateRef.current.sessions[key];
         if (!local || local.isStreaming || local.status === "running") return;
+      } else {
+        // A paused ask_user card is the one thing a snapshot must never
+        // replace. The interactive card is not a persisted row yet — it
+        // lives in the live turn's event stream, and the server's message
+        // list only grows it once the turn resumes — so LOAD_SESSION's
+        // whole-table swap here would erase the user's only way to answer
+        // (observed: the card vanished ~4s into a blackout). While a live
+        // unresolved card exists locally, the WS stream (resume replay,
+        // deferred reply re-send) is the source of truth for it; a snapshot
+        // swap is only safe once the card is gone.
+        const local = stateRef.current.sessions[key];
+        if (hasPendingAskUserInMessages(local?.messages, local?.activeTurnId)) {
+          return;
+        }
       }
       traceCacheRef.current.clear();
       const messages = hydrateMessages(session.messages ?? []);
@@ -2329,7 +2457,7 @@ export function ChatStateAdapterProvider({
         legacyPersistUserMessage === false
           ? false
           : undefined;
-      sendThroughRunner(
+      return sendThroughRunner(
         key,
         buildStartTurnInput({
         content,
@@ -2505,6 +2633,7 @@ export function ChatStateAdapterProvider({
       personaSelection: current.personaSelection,
       messages: current.messages,
       isStreaming: current.isStreaming,
+      activeTurnId: current.activeTurnId,
       currentStage: current.currentStage,
       language: current.language,
       selectedBranches: current.selectedBranches,

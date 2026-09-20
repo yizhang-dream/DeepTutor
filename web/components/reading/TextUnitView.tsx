@@ -121,6 +121,12 @@ export function TextUnitView({
       container: HTMLElement,
     ) => { prefix: string; suffix: string };
   } | null>(null);
+  // Touch and pen long-press selections usually end without a mouseup, so the
+  // "selection complete" path needs triggers of its own. Both bail out for
+  // `pointerType === "mouse"`, leaving the mouse path exactly as it was.
+  const activePointerTypeRef = useRef<string>("mouse");
+  const touchSelectionAtRef = useRef(0);
+  const touchSelectionTimerRef = useRef<number | null>(null);
   const [locator, setLocator] = useState(1);
   const [text, setText] = useState("");
   const [media, setMedia] = useState<MaterialMediaItem[]>([]);
@@ -487,6 +493,70 @@ export function TextUnitView({
     });
   }, [locator, onSelection, text]);
 
+  // The selection has settled under a finger or pen: run the same completion
+  // path a mouseup would, and stand down the debounce so it cannot run twice.
+  const finishSelectionFromTouch = useCallback(() => {
+    touchSelectionAtRef.current = Date.now();
+    if (touchSelectionTimerRef.current !== null) {
+      window.clearTimeout(touchSelectionTimerRef.current);
+      touchSelectionTimerRef.current = null;
+    }
+    handlePointerUp();
+  }, [handlePointerUp]);
+
+  const handleTouchPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      activePointerTypeRef.current =
+        event.pointerType === "touch" || event.pointerType === "pen"
+          ? event.pointerType
+          : "mouse";
+    },
+    [],
+  );
+
+  const handleTouchPointerUp = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.pointerType !== "touch" && event.pointerType !== "pen") return;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) return;
+      finishSelectionFromTouch();
+    },
+    [finishSelectionFromTouch],
+  );
+
+  useEffect(() => {
+    // The finger lifting is not always delivered here — the native selection
+    // handles own that gesture — so a selection that then goes quiet is the
+    // backstop. A plain selection *inside this article* is the only thing that
+    // qualifies, which keeps unrelated selections elsewhere page from firing.
+    const onSelectionChange = () => {
+      if (activePointerTypeRef.current === "mouse") return;
+      if (Date.now() - touchSelectionAtRef.current < 400) return;
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) return;
+      const node = selection.getRangeAt(0).commonAncestorContainer;
+      if (!articleRef.current?.contains(node)) return;
+      if (touchSelectionTimerRef.current !== null) {
+        window.clearTimeout(touchSelectionTimerRef.current);
+      }
+      touchSelectionTimerRef.current = window.setTimeout(() => {
+        touchSelectionTimerRef.current = null;
+        if (Date.now() - touchSelectionAtRef.current < 400) return;
+        const settled = window.getSelection();
+        if (!settled || settled.isCollapsed) return;
+        finishSelectionFromTouch();
+      }, 150);
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => {
+      document.removeEventListener("selectionchange", onSelectionChange);
+      if (touchSelectionTimerRef.current !== null) {
+        window.clearTimeout(touchSelectionTimerRef.current);
+        touchSelectionTimerRef.current = null;
+      }
+    };
+  }, [finishSelectionFromTouch]);
+
   const canPrev = locator > 1;
   const canNext = locator < unitCount;
 
@@ -597,6 +667,8 @@ export function TextUnitView({
         ref={containerRef}
         data-reader-unit={locator}
         onMouseUp={handlePointerUp}
+        onPointerDown={handleTouchPointerDown}
+        onPointerUp={handleTouchPointerUp}
         onScroll={handleContainerScroll}
         className="dt-reader-scroll flex-1 overflow-y-auto overscroll-contain px-5 py-6 sm:px-8"
       >

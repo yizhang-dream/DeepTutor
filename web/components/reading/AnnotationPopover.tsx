@@ -81,12 +81,21 @@ export function AnnotationPopover({
         onDismiss();
       }
     };
+    // Dismiss on a press that misses the toolbar, and only then. The test is
+    // containment of the *target*, never of coordinates or of a mouse compat
+    // event: a finger or a pen produces `pointerdown` with
+    // `pointerType: "touch" | "pen"` and hit-tests the real target just like a
+    // mouse does, so one rule covers every input. A press *inside* therefore
+    // returns early and the following `click` lands on the button that was
+    // aimed at instead of unmounting the toolbar under the finger.
+    //
+    // Capture phase: the reader's own handlers would otherwise clear the
+    // selection before this listener ran.
     const onPointerDown = (event: PointerEvent) => {
-      if (!ref.current?.contains(event.target as Node)) onDismiss();
+      if (ref.current?.contains(event.target as Node)) return;
+      onDismiss();
     };
     document.addEventListener("keydown", onKey);
-    // Capture phase: the reader's own mouseup handler would otherwise clear the
-    // selection before this listener ran.
     document.addEventListener("pointerdown", onPointerDown, true);
     return () => {
       document.removeEventListener("keydown", onKey);
@@ -102,7 +111,11 @@ export function AnnotationPopover({
       style={{ left: position.left, top: position.top }}
       className="dt-reader-popover fixed z-[70] w-max max-w-[min(360px,92vw)] rounded-xl border border-[var(--border)] bg-[var(--popover)] p-1.5 shadow-[0_10px_30px_-12px_rgba(0,0,0,0.35)]"
     >
-      <div className="flex items-center gap-1">
+      {/* `touch-manipulation` drops the browser's 300ms double-tap-zoom wait
+          and its "is this a scroll?" hesitation for every control in the row,
+          so a tap on a swatch or an action reads as a press immediately. It
+          is a gesture hint only — no visual change. */}
+      <div className="flex touch-manipulation items-center gap-1">
         <div className="flex items-center gap-0.5 pr-1">
           {ANNOTATION_COLORS.map((swatch) => (
             <button
@@ -169,7 +182,7 @@ export function AnnotationPopover({
             placeholder={t("Your note…")}
             className="w-full resize-none rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] leading-relaxed text-[var(--foreground)] outline-none transition focus:border-[var(--ring)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--ring)_20%,transparent)]"
           />
-          <div className="mt-1 flex items-center justify-end gap-1.5">
+          <div className="mt-1 flex touch-manipulation items-center justify-end gap-1.5">
             <button
               type="button"
               onClick={onDismiss}

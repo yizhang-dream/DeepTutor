@@ -330,6 +330,7 @@
   "Dialog": "对话框",
   "Reference space": "引用空间",
   "Connection lost while generating. Please retry your message.": "生成过程中连接已断开，请重新发送消息。",
+  "DeepTutor could not start that turn because the session already has an active one. Answer the open question or try again shortly.": "会话中已有进行中的回合，无法开启新回合。请先回答未完成的问题，或稍后重试。",
   "Couldn't reach the server. Please check your connection and retry.": "无法连接到服务器，请检查网络后重试。",
   "Today": "今天",
   "Yesterday": "昨天",

@@ -1,13 +1,8 @@
 "use client";
 
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-  type RefObject,
-} from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
+
+import { usePaneResize } from "@/hooks/usePaneResize";
 
 import { clampPanelRatio } from "../model/editor-state";
 import { loadSplitRatio, saveSplitRatio } from "../storage/drafts";
@@ -16,7 +11,6 @@ export function useSplitPane(containerRef: RefObject<HTMLElement | null>) {
   const [editorCollapsed, setEditorCollapsed] = useState(false);
   const [previewCollapsed, setPreviewCollapsed] = useState(false);
   const [editorRatio, setEditorRatio] = useState(0.5);
-  const [isResizingSplit, setIsResizingSplit] = useState(false);
   const preferencesLoadedRef = useRef(false);
   const showEditor = !editorCollapsed;
   const showPreview = !previewCollapsed;
@@ -33,39 +27,22 @@ export function useSplitPane(containerRef: RefObject<HTMLElement | null>) {
     saveSplitRatio(window.localStorage, editorRatio);
   }, [editorRatio]);
 
-  const handleSplitterPointerDown = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!showEditor || !showPreview) return;
-      event.preventDefault();
-      setIsResizingSplit(true);
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId);
-      } catch {
-        // Pointer capture is an enhancement; global listeners still complete the drag.
-      }
-    },
-    [showEditor, showPreview],
-  );
-
-  useEffect(() => {
-    if (!isResizingSplit) return;
-    const handleMove = (event: PointerEvent) => {
-      const container = containerRef.current;
-      if (!container) return;
-      const rect = container.getBoundingClientRect();
-      if (rect.width <= 0) return;
-      setEditorRatio(clampPanelRatio((event.clientX - rect.left) / rect.width));
-    };
-    const handleEnd = () => setIsResizingSplit(false);
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleEnd);
-    window.addEventListener("pointercancel", handleEnd);
-    return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleEnd);
-      window.removeEventListener("pointercancel", handleEnd);
-    };
-  }, [containerRef, isResizingSplit]);
+  const { isResizing: isResizingSplit, onPointerDown: handleSplitterPointerDown } =
+    usePaneResize({
+      getStartWidth: () => editorRatio,
+      computeWidth: (startWidth, event) => {
+        const container = containerRef.current;
+        if (!container) return startWidth;
+        const rect = container.getBoundingClientRect();
+        if (rect.width <= 0) return startWidth;
+        return clampPanelRatio((event.clientX - rect.left) / rect.width);
+      },
+      // Persistence keeps riding the existing effect below: every ratio change
+      // (including the final one committed on up/cancel) is saved.
+      onWidth: setEditorRatio,
+      // Idempotent final commit so a pointercancel still persists the ratio.
+      onEnd: setEditorRatio,
+    });
 
   return {
     editorCollapsed,

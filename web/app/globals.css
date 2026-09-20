@@ -282,6 +282,38 @@
   }
 }
 
+/* ─── Touch: controls that only exist under `group-hover` ───
+   Copy / branch / edit on a message, the remove button on a composer
+   attachment chip, and the same pattern elsewhere in chat are hidden with
+   `opacity-0` and revealed with `group-hover:opacity-100`. A touch screen has
+   no hover state to enter, so those controls are permanently invisible (and,
+   because `opacity-0` still hit-tests, invisible *and* tappable).
+
+   `@media (hover: none)` is the capability query for "the primary input
+   cannot hover" — a phone or tablet. It is deliberately not `any-pointer:
+   coarse`: a laptop with a touchscreen reports `hover: hover` for its mouse
+   and its touch users keep the existing hover behaviour, so desktop is
+   untouched.
+
+   `:not(.pointer-events-none)` keeps hover-only *labels* out of this. Some
+   hover reveals are informational and cannot be pressed at all — the tooltips
+   in `features/co-writer` and the floating chip over a books block — and
+   forcing those on would paint permanent chrome over the content. A control
+   worth pressing never carries `pointer-events-none`.
+
+   These selectors carry the same specificity (0,1,0)+ as Tailwind's
+   `.opacity-0`, so plain source order — this block is emitted after
+   `@tailwind utilities` — is what makes them win. */
+@media (hover: none) {
+  .group-hover\:opacity-100:not(.pointer-events-none),
+  .group-hover\/ref\:opacity-100:not(.pointer-events-none),
+  .group-hover\/row\:opacity-100:not(.pointer-events-none),
+  .group-hover\/starters\:opacity-100:not(.pointer-events-none),
+  .group-hover\/title\:opacity-100:not(.pointer-events-none) {
+    opacity: 1;
+  }
+}
+
 /* ─── Scrollbar ─── */
 ::-webkit-scrollbar {
   width: 6px;

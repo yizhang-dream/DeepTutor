@@ -24,18 +24,32 @@ import type {
 
 export type ClientCommand = GeneratedClientCommand;
 export type ServerEvent = GeneratedServerEvent;
-export type StreamEventType = GeneratedStreamEventType;
+/**
+ * The generated union lists only the frames that belong to a turn's event
+ * stream. ``protocol_error`` is not one of them — it is the server's
+ * verdict on a *command* (notably ``start_turn`` on a session that still
+ * holds a live or recovering turn) — but the UI needs it as a stream event
+ * all the same: without it the composer keeps claiming a turn is running
+ * that the server refused to start.
+ */
+export type StreamEventType = GeneratedStreamEventType | "protocol_error";
 export type LLMSelection = GeneratedLLMSelection;
 
 export type StreamEvent = Omit<
   GeneratedStreamEvent,
-  "content" | "metadata" | "source" | "stage" | "session_id"
+  | "content"
+  | "metadata"
+  | "source"
+  | "stage"
+  | "session_id"
+  | "type"
 > & {
   content: string;
   metadata: Record<string, unknown>;
   source: string;
   stage: string;
   session_id?: string;
+  type: StreamEventType;
 };
 
 type UnversionedCommand<T, Kind extends string> = Omit<

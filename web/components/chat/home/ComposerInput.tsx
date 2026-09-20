@@ -25,6 +25,12 @@ interface ComposerInputProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   isVisualizeMode: boolean;
   isStreaming?: boolean;
+  /**
+   * The live turn is paused on an ask_user card and waiting for the answer
+   * the user is typing. Enter must send that answer even though the turn is
+   * technically still streaming — same rule as StandaloneComposer.
+   */
+  awaitingUserReply?: boolean;
   // When true, parent has attachments/references queued and will accept a
   // send even if the text body is empty. Without this, Enter would silently
   // do nothing for an attachment-only message.
@@ -141,6 +147,7 @@ export const ComposerInput = memo(
       textareaRef,
       isVisualizeMode,
       isStreaming = false,
+      awaitingUserReply = false,
       canSendEmpty,
       onSend,
       onInputChange,
@@ -337,7 +344,11 @@ export const ComposerInput = memo(
         }
         if (shouldSubmitOnEnter(e, isComposingRef.current)) {
           e.preventDefault();
-          if (!isStreaming) doSend();
+          // A turn paused on a question is still "streaming", but the only
+          // thing that can move it forward is the user's answer — Enter is
+          // how that answer goes out (mirrors StandaloneComposer).
+          if (isStreaming && !awaitingUserReply) return;
+          doSend();
         } else if (e.key === "Escape") {
           setShowAtPopup(false);
           setShowSlashPopup(false);
@@ -346,6 +357,7 @@ export const ComposerInput = memo(
       [
         doSend,
         isStreaming,
+        awaitingUserReply,
         showSlashPopup,
         handleSelectSlashPersona,
         showAtPopup,

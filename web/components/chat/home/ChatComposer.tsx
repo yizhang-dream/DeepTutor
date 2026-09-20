@@ -774,6 +774,7 @@ export default memo(function ChatComposer({
             textareaRef={textareaRef}
             isVisualizeMode={isVisualizeMode}
             isStreaming={isStreaming}
+            awaitingUserReply={awaitingUserReply}
             canSendEmpty={hasReferences}
             onSend={doSend}
             onInputChange={handleInputChange}

@@ -73,7 +73,7 @@ import {
 import { readChatLaunchIntent } from "@/lib/chat-launch-intent";
 import { useAttachmentLimits } from "@/lib/attachment-limits";
 import {
-  hasPendingAskUser,
+  hasPendingAskUserInMessages,
   hasPendingUserCard,
   REPLY_SENT_AS_NEW_MESSAGE,
 } from "@/lib/ask-user-state";
@@ -985,7 +985,21 @@ export default function ChatWorkspace() {
      their next message is a new turn, not a reply into a finished one. Hence
      the wider predicate for the pin and the pause-only one for routing. */
   const awaitingUserCard = hasPendingUserCard(lastMessage?.events);
-  const awaitingUserReply = hasPendingAskUser(lastMessage?.events);
+  // The card that pauses the turn is not always the last message: once the
+  // socket drops, a recovering turn can append another assistant row after
+  // it (and any busy turn can keep writing). Deciding from the last message
+  // alone flipped the send button to "Stop generating" mid-pause, so tapping
+  // it cancelled the turn the user was trying to answer. What matters is the
+  // current turn: any unresolved card it owns keeps the composer in reply
+  // mode — the same predicate the adapter's submitUserReply gate uses.
+  // Turn-scoped ONLY while a turn is actually live: with ``activeTurnId``
+  // null (cancel/fail already cleared it) every card would count as
+  // belonging to "the turn" — and a stale unanswered card left behind by a
+  // cancelled turn would route the next message through submit_user_reply,
+  // fail, and pop "sent as a new message" before sending nothing.
+  const awaitingUserReply = state.activeTurnId
+    ? hasPendingAskUserInMessages(state.messages, state.activeTurnId)
+    : false;
   // Read inside ``handleSend`` without adding a dependency that would rebuild
   // the callback (and so the composer) on every streamed event.
   const awaitingUserReplyRef = useRef(awaitingUserReply);
@@ -1771,15 +1785,18 @@ export default function ChatWorkspace() {
       // a new message. Routing it here means the card is one way to answer,
       // not the only one — and a card that never rendered no longer strands
       // the learner with a turn they can only cancel.
+      let replyFallback = false;
       if (awaitingUserReplyRef.current) {
         if (!content.trim()) return;
         if (await submitUserReply({ text: content })) return;
-        // Refused: the turn that asked is gone. Do NOT stop here. The
-        // composer has already cleared the box, so returning discarded what
-        // they typed — while the error told them to "send a new message",
-        // which is exactly what this branch was preventing them from doing.
-        // Fall through and send it as one.
+        // Refused — the turn that asked is gone, or the transport timed out
+        // waiting for the ack on a flaky remote connection. Do NOT stop
+        // here. The composer has already cleared the box, so returning
+        // discarded what they typed — while the error told them to "send a
+        // new message", which is exactly what this branch was preventing
+        // them from doing. Fall through and send it as one.
         notify(t(REPLY_SENT_AS_NEW_MESSAGE));
+        replyFallback = true;
       }
       if (
         (!content &&
@@ -1790,7 +1807,10 @@ export default function ChatWorkspace() {
           !selectedHistorySessions.length &&
           !selectedQuestionEntries.length &&
           !selectedMemoryFiles.length) ||
-        state.isStreaming
+        // The paused turn keeps ``isStreaming`` true, so without the
+        // fallback bypass this guard would decline the very send the
+        // branch above exists for — and silently drop the cleared text.
+        (state.isStreaming && !replyFallback)
       )
         return;
 
@@ -1883,7 +1903,7 @@ export default function ChatWorkspace() {
       // Persona is NOT passed per-call here: it is a session-level
       // preference (state.personaSelection) that sendMessage resolves and
       // sends with every turn.
-      sendMessage(
+      const delivered = await sendMessage(
         messageContent,
         extraAttachments,
         config,
@@ -1897,20 +1917,29 @@ export default function ChatWorkspace() {
         undefined,
         memoryPayload,
       );
-      shouldAutoScrollRef.current = true;
-      setAttachments([]);
-      setSelectedBookReferences([]);
-      setSelectedReadingReferences([]);
-      setSelectedNotebookRecords([]);
-      setSelectedHistorySessions([]);
-      setSelectedAgentSessions([]);
-      setSelectedQuestionEntries([]);
-      setSelectedMemoryFiles([]);
+      if (delivered) {
+        shouldAutoScrollRef.current = true;
+        setAttachments([]);
+        setSelectedBookReferences([]);
+        setSelectedReadingReferences([]);
+        setSelectedNotebookRecords([]);
+        setSelectedHistorySessions([]);
+        setSelectedAgentSessions([]);
+        setSelectedQuestionEntries([]);
+        setSelectedMemoryFiles([]);
+      } else {
+        // Never handed to a socket — the adapter has already marked the
+        // turn failed and raised its own toast. The message text would
+        // silently vanish (the composer cleared it), so put it back: a
+        // retry is one Enter away instead of a retype.
+        handlePrefillComposer(content);
+      }
     },
     [
       attachments,
       bookReferencesPayload,
       courseId,
+      handlePrefillComposer,
       readingReferencesPayload,
       historyReferencesPayload,
       isQuizMode,

@@ -894,6 +894,9 @@ const InteractiveAskUserCard = memo(function InteractiveAskUserCard({
   } = useCardSubmission(onSubmit);
   // Same lock, two reasons: answers are in flight, or the question is not
   // finished being asked. Either way nothing on the card may be touched.
+  // An explicitly failed submission ("not delivered") does NOT lock: the
+  // hook resets ``sending``, the question finished long ago, and the card
+  // is the user's only way back into the turn that is still waiting.
   const locked = submitted || streaming;
 
   const activeQuestion = payload.questions[activeIdx] ?? payload.questions[0];
@@ -1007,12 +1010,15 @@ const InteractiveAskUserCard = memo(function InteractiveAskUserCard({
                 : "text-[var(--muted-foreground)]")
             }
           >
-            {streaming
-              ? t("Writing the question…")
-              : submitted
-                ? t("Sending your answers…")
-                : submitFailed
-                  ? t(REPLY_NOT_DELIVERED)
+            {/* Failure outranks everything: a user who answered must see
+                that the answer did not land, even while the turn is still
+                streaming — it is the only actionable thing on the card. */}
+            {submitFailed
+              ? t(REPLY_NOT_DELIVERED)
+              : streaming
+                ? t("Writing the question…")
+                : submitted
+                  ? t("Sending your answers…")
                   : totalQuestions > 1
                     ? t("{{count}} questions — tap a tab to switch.", {
                         count: totalQuestions,

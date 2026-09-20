@@ -71,6 +71,7 @@ import { useSelectionEdit } from "@/features/co-writer/hooks/useSelectionEdit";
 import { useSplitPane } from "@/features/co-writer/hooks/useSplitPane";
 import { useSynchronizedScroll } from "@/features/co-writer/hooks/useSynchronizedScroll";
 import { useDocumentLifecycle } from "@/features/co-writer/hooks/useDocumentLifecycle";
+import { usePaneResize } from "@/hooks/usePaneResize";
 import type { NotebookSavePayload } from "@/components/notebook/SaveToNotebookModal";
 import { CO_WRITER_SAMPLE_TEMPLATE } from "@/app/(workspace)/co-writer/sampleTemplate";
 
@@ -215,8 +216,10 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
   const selectionPopoverRef = useRef<HTMLDivElement>(null);
   const preserveSelectionTraceRef = useRef(false);
   const selectionDragStateRef = useRef<{
-    offsetX: number;
-    offsetY: number;
+    left: number;
+    top: number;
+    startClientX: number;
+    startClientY: number;
   } | null>(null);
   const [markdown, setMarkdown] = useState("");
   // Async edits (full-draft edit, auto-mark, selection edit) must verify the
@@ -255,8 +258,44 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
   const [selectionTrace, setSelectionTrace] =
     useState<SelectionTraceData | null>(null);
   const [selectionPopoverPinned, setSelectionPopoverPinned] = useState(false);
-  const [isDraggingSelectionPopover, setIsDraggingSelectionPopover] =
-    useState(false);
+  // 选区浮层拖动的 y 坐标暂存：usePaneResize 是一维（宽度）手势模型，
+  // 而浮层拖拽是二维偏移，所以起点与按下时的指针坐标记在
+  // selectionDragStateRef 里，computeWidth 返回横向位置、顺手把纵向位置
+  // 写进这个 ref，onWidth 再一起应用。
+  const selectionDragTopRef = useRef(0);
+  // 复用 usePaneResize 的指针生命周期：pointerId / isPrimary / button 守卫，
+  // pointerup + pointercancel + lostpointercapture 收尾，卸载时 dispose。
+  const {
+    isResizing: isDraggingSelectionPopover,
+    onPointerDown: beginSelectionPopoverDrag,
+  } = usePaneResize({
+    getStartWidth: () => selectionDragStateRef.current?.left ?? 0,
+    computeWidth: (startLeft, event) => {
+      const dragStart = selectionDragStateRef.current;
+      if (!dragStart) return startLeft;
+      const popover = selectionPopoverRef.current;
+      const width = popover?.offsetWidth || 360;
+      const height = popover?.offsetHeight || 200;
+      selectionDragTopRef.current = Math.min(
+        Math.max(event.clientY - (dragStart.startClientY - dragStart.top), 12),
+        window.innerHeight - height - 12,
+      );
+      return Math.min(
+        Math.max(event.clientX - (dragStart.startClientX - dragStart.left), 12),
+        window.innerWidth - width - 12,
+      );
+    },
+    onWidth: (left) =>
+      setSelectionPopover((prev) => ({
+        ...prev,
+        visible: true,
+        top: selectionDragTopRef.current,
+        left,
+      })),
+    onEnd: () => {
+      selectionDragStateRef.current = null;
+    },
+  });
 
   const [undoStack, setUndoStack] = useState<string[]>([]);
   const [redoStack, setRedoStack] = useState<string[]>([]);
@@ -552,7 +591,6 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
     cancelSelectionRequest();
     selectionDragStateRef.current = null;
     setSelectionPopoverPinned(false);
-    setIsDraggingSelectionPopover(false);
     setSelectionPopover((prev) => ({ ...prev, visible: false }));
     setSelectedRange(null);
     setSelectionInstruction("");
@@ -878,7 +916,7 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
   }, []);
 
   const handleSelectionPopoverDragStart = useCallback(
-    (event: React.MouseEvent<HTMLDivElement>) => {
+    (event: React.PointerEvent<HTMLDivElement>) => {
       const target = event.target as HTMLElement;
       if (
         target.closest(
@@ -887,17 +925,24 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
       ) {
         return;
       }
-      event.preventDefault();
+      // 只有主指针的左键按下才进入拖拽；usePaneResize 内部还有同一组守卫兜底。
+      if (!event.isPrimary || event.button !== 0) return;
       selectionDragStateRef.current = {
-        offsetX: event.clientX - selectionPopover.left,
-        offsetY: event.clientY - selectionPopover.top,
+        left: selectionPopover.left,
+        top: selectionPopover.top,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
       };
       setSelectionPopoverPinned(true);
-      setIsDraggingSelectionPopover(true);
       setIsToolMenuOpen(false);
       setIsModeMenuOpen(false);
+      beginSelectionPopoverDrag(event);
     },
-    [selectionPopover.left, selectionPopover.top],
+    [
+      beginSelectionPopoverDrag,
+      selectionPopover.left,
+      selectionPopover.top,
+    ],
   );
 
   const updateSelectionTraceFromEvent = useCallback(
@@ -1274,41 +1319,6 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [hideSelectionPopover, selectionPopover.visible]);
-
-  useEffect(() => {
-    if (!isDraggingSelectionPopover) return;
-    const handleMouseMove = (event: MouseEvent) => {
-      const dragState = selectionDragStateRef.current;
-      const popover = selectionPopoverRef.current;
-      if (!dragState || !popover) return;
-      const width = popover.offsetWidth || 360;
-      const height = popover.offsetHeight || 200;
-      const nextLeft = Math.min(
-        Math.max(event.clientX - dragState.offsetX, 12),
-        window.innerWidth - width - 12,
-      );
-      const nextTop = Math.min(
-        Math.max(event.clientY - dragState.offsetY, 12),
-        window.innerHeight - height - 12,
-      );
-      setSelectionPopover((prev) => ({
-        ...prev,
-        visible: true,
-        top: nextTop,
-        left: nextLeft,
-      }));
-    };
-    const handleMouseUp = () => {
-      selectionDragStateRef.current = null;
-      setIsDraggingSelectionPopover(false);
-    };
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [isDraggingSelectionPopover]);
 
   // ── Line-anchored scroll synchronization ──
   //
@@ -1915,7 +1925,7 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
             aria-label={t("Resize editor and preview")}
             onPointerDown={handleSplitterPointerDown}
             onDoubleClick={() => setEditorRatio(0.5)}
-            className={`group relative z-10 flex w-1 shrink-0 cursor-col-resize items-stretch border-x border-[var(--border)] transition-colors ${
+            className={`group relative z-10 flex w-1 shrink-0 cursor-col-resize touch-none items-stretch border-x border-[var(--border)] transition-colors ${
               isResizingSplit
                 ? "bg-[var(--primary)]/40"
                 : "bg-transparent hover:bg-[var(--primary)]/30"
@@ -1923,7 +1933,7 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
             title={t("Drag to resize, double-click to reset")}
           >
             {/* Wider invisible hit-area so the handle is easy to grab */}
-            <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
+            <div className="absolute inset-y-0 -left-1.5 -right-1.5 touch-none" />
             <div
               className={`pointer-events-none absolute left-1/2 top-1/2 h-10 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full transition-opacity ${
                 isResizingSplit
@@ -1993,8 +2003,8 @@ export default function CoWriterWorkspace({ docId }: CoWriterWorkspaceProps) {
       {selectionPopover.visible && selectedRange && (
         <div
           ref={selectionPopoverRef}
-          onMouseDown={handleSelectionPopoverDragStart}
-          className={`dt-popup-up fixed z-50 rounded-2xl border border-[var(--border)] bg-[var(--popover)] p-2.5 shadow-lg backdrop-blur-md ${
+          onPointerDown={handleSelectionPopoverDragStart}
+          className={`dt-popup-up fixed z-50 touch-none rounded-2xl border border-[var(--border)] bg-[var(--popover)] p-2.5 shadow-lg backdrop-blur-md ${
             isDraggingSelectionPopover ? "cursor-grabbing" : "cursor-grab"
           }`}
           style={{

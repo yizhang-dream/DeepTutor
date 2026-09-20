@@ -330,6 +330,7 @@
   "Dialog": "Dialog",
   "Reference space": "Reference space",
   "Connection lost while generating. Please retry your message.": "Connection lost while generating. Please retry your message.",
+  "DeepTutor could not start that turn because the session already has an active one. Answer the open question or try again shortly.": "DeepTutor could not start that turn because the session already has an active one. Answer the open question or try again shortly.",
   "Couldn't reach the server. Please check your connection and retry.": "Couldn't reach the server. Please check your connection and retry.",
   "Today": "Today",
   "Yesterday": "Yesterday",

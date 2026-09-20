@@ -36,6 +36,7 @@ import { useTranslation } from "react-i18next";
 import type { JumpRequest } from "@/components/reading/PdfDocumentView";
 import { READER_ASK_EVENT, ReaderPane } from "@/components/reading/ReaderPane";
 import { useChatStateAdapter } from "@/features/chat/ChatStateAdapter";
+import { usePaneResize } from "@/hooks/usePaneResize";
 import { readingSessionIdFromPath } from "@/lib/mastery-session";
 import type { ReaderHeading } from "@/lib/reading-outline";
 import { setReadingViewport } from "@/lib/reading-turn-state";
@@ -336,82 +337,70 @@ export function ReadingWorkspacePage() {
     [linkedSessionIds, selection, sendMessage, state.isStreaming],
   );
 
-  const startCompanionResize = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const startX = event.clientX;
-      const startWidth = companionWidth;
-      // The companion may grow until the reader — and the open navigator —
-      // are left at their minimum widths; nothing is otherwise capped.
+  // The companion may grow until the reader — and the open navigator — are
+  // left at their minimum widths; nothing is otherwise capped. The ceiling is
+  // measured once per press, in `getStartWidth`, so a mid-drag reflow cannot
+  // move the goalposts under the pointer.
+  const companionMaxRef = useRef(COMPANION_MIN_WIDTH);
+  const companionResize = usePaneResize({
+    getStartWidth: () => {
       const frame = gridRef.current?.clientWidth ?? window.innerWidth;
-      const max = Math.max(
+      companionMaxRef.current = Math.max(
         COMPANION_MIN_WIDTH,
         frame -
           (navigatorCollapsed ? 0 : navigatorWidth) -
           (navigatorCollapsed ? 5 : 10) -
           READER_MIN_WIDTH,
       );
-      const onMove = (moveEvent: PointerEvent) => {
-        const next = startWidth + (startX - moveEvent.clientX);
-        setCompanionWidth(Math.min(max, Math.max(300, Math.round(next))));
-      };
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        setCompanionWidth((current) => {
-          try {
-            browserStorage.writeRaw(
-              "local",
-              "dt.reader.companionWidth",
-              String(current),
-            );
-          } catch {
-            // A blocked or private store just resets to default next time.
-          }
-          return current;
-        });
-      };
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
+      return companionWidth;
     },
-    [companionWidth, navigatorCollapsed, navigatorWidth],
-  );
-
-  const startNavigatorResize = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
-      event.preventDefault();
-      const startX = event.clientX;
-      const startWidth = navigatorWidth;
-      const onMove = (moveEvent: PointerEvent) => {
-        const next = startWidth + (moveEvent.clientX - startX);
-        setNavigatorWidth(
-          Math.min(
-            NAVIGATOR_MAX_WIDTH,
-            Math.max(NAVIGATOR_MIN_WIDTH, Math.round(next)),
-          ),
+    computeWidth: (startWidth, event, start) =>
+      Math.min(
+        companionMaxRef.current,
+        Math.max(
+          COMPANION_MIN_WIDTH,
+          Math.round(startWidth + (start.clientX - event.clientX)),
+        ),
+      ),
+    onWidth: setCompanionWidth,
+    // Persisted here rather than in the pointerup handler so a cancelled
+    // touch gesture lands the width it actually reached.
+    onEnd: (width) => {
+      try {
+        browserStorage.writeRaw(
+          "local",
+          "dt.reader.companionWidth",
+          String(width),
         );
-      };
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        setNavigatorWidth((current) => {
-          try {
-            browserStorage.writeRaw(
-              "local",
-              "dt.reader.navigatorWidth",
-              String(current),
-            );
-          } catch {
-            // A blocked or private store just resets to default next time.
-          }
-          return current;
-        });
-      };
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
+      } catch {
+        // A blocked or private store just resets to default next time.
+      }
     },
-    [navigatorWidth],
-  );
+  });
+
+  const navigatorResize = usePaneResize({
+    getStartWidth: () => navigatorWidth,
+    computeWidth: (startWidth, event, start) =>
+      Math.min(
+        NAVIGATOR_MAX_WIDTH,
+        Math.max(
+          NAVIGATOR_MIN_WIDTH,
+          Math.round(startWidth + (event.clientX - start.clientX)),
+        ),
+      ),
+    onWidth: setNavigatorWidth,
+    onEnd: (width) => {
+      try {
+        browserStorage.writeRaw(
+          "local",
+          "dt.reader.navigatorWidth",
+          String(width),
+        );
+      } catch {
+        // A blocked or private store just resets to default next time.
+      }
+    },
+  });
 
   if (loading) {
     return (
@@ -750,8 +739,8 @@ export function ReadingWorkspacePage() {
             role="separator"
             aria-orientation="vertical"
             aria-label={t("Resize contents navigator")}
-            onPointerDown={startNavigatorResize}
-            className="group/resize relative z-10 hidden cursor-col-resize xl:block"
+            onPointerDown={navigatorResize.onPointerDown}
+            className="group/resize relative z-10 hidden cursor-col-resize touch-none select-none xl:block"
           >
             <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-[var(--border)] transition-colors group-hover/resize:bg-[var(--primary)] group-active/resize:bg-[var(--primary)]" />
           </div>
@@ -838,8 +827,8 @@ export function ReadingWorkspacePage() {
             role="separator"
             aria-orientation="vertical"
             aria-label={t("Resize reading companion")}
-            onPointerDown={startCompanionResize}
-            className="group/resize relative z-10 hidden cursor-col-resize xl:block"
+            onPointerDown={companionResize.onPointerDown}
+            className="group/resize relative z-10 hidden cursor-col-resize touch-none select-none xl:block"
           >
             <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-[var(--border)] transition-colors group-hover/resize:bg-[var(--primary)] group-active/resize:bg-[var(--primary)]" />
           </div>
