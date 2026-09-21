@@ -431,8 +431,15 @@ async def list_library_materials(
     store = _store()
     try:
         for manifest in store.list_materials():
-            if catalog.get_material(manifest.material_id) is None:
-                catalog.register_manifest(manifest)
+            if catalog.get_material(manifest.material_id) is not None:
+                continue
+            # A content dir named after its hash can outlive a deleted row; if
+            # that content already belongs to another material (an alias whose
+            # content_id matches the dir name), re-registering the dir would
+            # resurrect a ghost row. Skip it.
+            if catalog.find_material_by_content(manifest.material_id) is not None:
+                continue
+            catalog.register_manifest(manifest)
         rows = [
             row
             for row in catalog.list_materials(
